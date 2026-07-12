@@ -1,0 +1,4 @@
+Machine Learning Core Concepts:
+1. Ensemble Methods: Bagging (Bootstrap Aggregating) reduces variance by training multiple models in parallel on random subsets of data (e.g., Random Forest). Boosting reduces bias by training models sequentially, where each new model focuses on the errors of the previous one (e.g., XGBoost).
+2. API Rate Limiting: In FastAPI backend systems, rate limiting is crucial to prevent API exhaustion. A common strategy is the Token Bucket algorithm implemented via Redis, which tracks requests per user in a fast, in-memory store.
+3. Transformer Architecture: In the self-attention mechanism, the dot product of Query and Key vectors is scaled by 1/sqrt(d_k) to prevent the softmax function from being pushed into regions with extremely small gradients, which would halt learning.
