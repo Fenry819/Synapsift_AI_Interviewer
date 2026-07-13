@@ -98,7 +98,6 @@ def generate_ai_response(messages: list) -> str:
 
     try:
         print("🤖 Querying Local Mistral Node via Ollama standard pipeline...")
-        # Extended timeout to 120 seconds to completely mitigate VRAM cold-start load delays
         with httpx.Client(timeout=120.0) as client:
             ollama_response = client.post(
                 "http://127.0.0.1:11434/api/generate",
@@ -128,15 +127,6 @@ def initialize_vector_db():
             collection_name=collection_name,
             vectors_config=VectorParams(size=384, distance=Distance.COSINE),
         )
-        if os.path.exists("knowledge_base.txt"):
-            with open("knowledge_base.txt", "r", encoding="utf-8") as f:
-                text = f.read()
-            splitter = RecursiveCharacterTextSplitter(chunk_size=400, chunk_overlap=50)
-            chunks = splitter.split_text(text)
-            vector_db = QdrantVectorStore(client=client, collection_name=collection_name, embedding=embeddings)
-            vector_db.add_texts(chunks)
-            return vector_db
-            
     return QdrantVectorStore(client=client, collection_name=collection_name, embedding=embeddings)
 
 vector_db = initialize_vector_db()
@@ -222,18 +212,26 @@ async def login(credentials: LoginRequest):
 async def start_interview(role: str = Form(...), resume: UploadFile = File(...), user_meta: dict = Depends(get_current_user)):
     interview_id = "interview_" + os.urandom(4).hex()
     
-    # 1. Resume Processing: Extract Data
     pdf_bytes = await resume.read()
     reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
     resume_text = "".join([page.extract_text() + "\n" for page in reader.pages])[:1500] 
 
-    # 2. Context Construction & Knowledge Retrieval
-    # We use a slice of the resume to dynamically pull textbook concepts that match the candidate's actual skills
     search_query = f"Target Role: {role}. Candidate Background: {resume_text[:300]}"
-    docs = vector_db.similarity_search(search_query, k=1)
-    rag_context = docs[0].page_content if docs else "General technical principles."
+    
+    # 🌟 MULTI-TIER RAG FALLBACK SYSTEM 🌟
+    try:
+        # Tier 1: Try strict metadata match for the requested role
+        docs = vector_db.similarity_search(search_query, k=1, filter={"target_role": role})
+    except Exception:
+        docs = []
 
-    # 3. Question Generation (Influenced by background + Context aware)
+    # Tier 2 & 3: Fallback to general search if the role doesn't exist in metadata
+    if not docs:
+        print(f"⚠️ Custom Role detected: '{role}'. Routing to global textbook search.")
+        docs = vector_db.similarity_search(search_query, k=1)
+        
+    rag_context = docs[0].page_content if docs else "General software engineering and machine learning principles."
+
     prompt = HumanMessage(
         content=f"""You are a professional technical interviewer for a {role} position.
         Candidate Resume Extract: {resume_text}
@@ -278,20 +276,33 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
         conn.close()
         return {"reply": "Thank you. We have completed all technical validation tracks for this session. Compiling core analytics metrics...", "status": "COMPLETED"}
 
-    docs = vector_db.similarity_search(payload.message, k=1)
+    # Dynamic Query Formulation: Prevent searching for "I don't know"
+    search_query = payload.message if len(payload.message) > 15 else f"Advanced interview concepts for {payload.role}"
+    
+    # 🌟 MULTI-TIER RAG FALLBACK SYSTEM 🌟
+    try:
+        docs = vector_db.similarity_search(search_query, k=1, filter={"target_role": payload.role})
+    except Exception:
+        docs = []
+
+    if not docs:
+        docs = vector_db.similarity_search(search_query, k=1)
+        
     rag_context = docs[0].page_content if docs else "Core computer systems engineering."
 
     prompt = HumanMessage(
-        content=f"""You are a senior engineering manager conducting a technical interview for a {payload.role} role.
-        Knowledge Base Reference text: {rag_context}
-        Candidate's exact response: "{payload.message}"
+        content=f"""You are a strict, professional technical interviewer for a {payload.role} role.
+        Textbook Reference: {rag_context}
+        Candidate responded: "{payload.message}"
         
         Instructions:
-        - If the candidate says 'I don't know', asks you to explain, or explicitly requests clarification: Briefly explain the solution to them in exactly 1-2 clear sentences. Then, transition smoothly to ask a NEW related question.
-        - If they answered technically: Silently assess accuracy, do not tell them if they are right or wrong, and smoothly transition to the next technical question.
+        - If candidate says 'I don't know' or requests help: Explain the concept in EXACTLY ONE sentence. Then ask a NEW technical question based on the textbook reference.
+        - If they answered technically: Do NOT evaluate them out loud. Immediately ask the next technical question based on the textbook reference.
         
-        CRITICAL OUTPUT GUARDRAIL:
-        Output ONLY the verbal conversational response spoken out loud. Start speaking immediately."""
+        CRITICAL RULES:
+        - MAXIMUM 2 SENTENCES TOTAL.
+        - NEVER use conversational filler like "Alright, let's discuss..." or "Now, let's move on".
+        - Be direct and professional."""
     )
     next_question = generate_ai_response([prompt])
 
@@ -324,28 +335,29 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
             current_question = None
             
     if current_question:
-        qa_pairs.append({"question": current_question, "answer": "[No response provided - Session concluded early]"})
+        qa_pairs.append({"question": current_question, "answer": "[No response provided]"})
 
     verification_payload = json.dumps(qa_pairs, indent=2)
     
-    # UPGRADED SCHEMA: Added 'insights' to fulfill assignment requirement
     prompt = HumanMessage(
-        content=f"""You are an elite technical evaluator analyzing a completed engineering interview transcript.
+        content=f"""You are an elite technical evaluator grading an interview.
         
-        Verified Q&A Matrix Log:
+        Q&A Transcript:
         {verification_payload}
         
-        Output a strict JSON object structure only. Expected keys:
+        CRITICAL INSTRUCTION: Output ONLY a valid JSON object. Do not include markdown backticks (```) or any introductory text.
+        
+        YOU MUST EXACTLY MATCH THIS TEMPLATE FORMAT:
         {{
-            "overallScore": <integer 0-100>,
-            "summary": "<2 sentence overall engineering review overview>",
-            "insights": "<2 sentence summary of strengths, weaknesses, and domain exposure>",
+            "overallScore": 75,
+            "summary": "Candidate showed some knowledge but struggled with deep technical concepts.",
+            "insights": "Strengths: Basic understanding. Weaknesses: Core algorithms.",
             "breakdown": [
                 {{
-                    "question": "<Copy matching question from payload>",
-                    "answer": "<Copy matching candidate answer from payload>",
-                    "score": <integer 0-100 grading this answer>,
-                    "feedback": "<1 sentence precise feedback item detailing accuracy gaps>"
+                    "question": "The interviewer's question here",
+                    "answer": "The candidate's answer here",
+                    "score": 0,
+                    "feedback": "Candidate failed to define the concept."
                 }}
             ]
         }}"""
@@ -353,13 +365,16 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
     response_text = generate_ai_response([prompt])
     
     try:
-        # ADVANCED JSON PARSER: Uses Regex to extract the JSON block even if Mistral adds conversational text around it
-        json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if json_match:
-            clean_json = json_match.group(0)
-            return json.loads(clean_json)
+        clean_text = response_text.replace("```json", "").replace("```", "").strip()
+        start_idx = clean_text.find('{')
+        end_idx = clean_text.rfind('}')
+        
+        if start_idx != -1 and end_idx != -1:
+            json_str = clean_text[start_idx:end_idx+1]
+            return json.loads(json_str)
         else:
-            raise ValueError("No JSON object found in response.")
+            raise ValueError("No JSON boundaries found.")
+            
     except Exception as e:
         print(f"JSON Parsing Failed: {e}. Raw Response: {response_text}")
         return {
@@ -368,7 +383,7 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
             "insights": "Candidate completed all questions, but LLM analytics engine failed to parse insights.",
             "breakdown": [{"question": p["question"], "answer": p["answer"], "score": 50, "feedback": "Logs saved for manual review."} for p in qa_pairs]
         }
-        
+
 @app.get("/api/admin/candidates")
 async def get_all_candidates(user_meta: dict = Depends(get_current_user)):
     if user_meta.get("role") != "admin":

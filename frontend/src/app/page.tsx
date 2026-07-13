@@ -30,7 +30,8 @@ export default function SynapSiftScreener() {
   const [userName, setUserName] = useState<string>('');
 
   // Interview States
-  const [selectedRole, setSelectedRole] = useState<string>('AI/ML Engineering Intern');
+  const [selectedRole, setSelectedRole] = useState('AI / Machine Learning Role');
+  const [customRole, setCustomRole] = useState(''); 
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
   const [inputAnswer, setInputAnswer] = useState<string>('');
   const [isAiThinking, setIsAiThinking] = useState<boolean>(false);
@@ -101,6 +102,7 @@ export default function SynapSiftScreener() {
 
   const startSession = async () => {
     if (!uploadedFile || !userToken) return alert("Please upload a resume file to calibrate context.");
+    if (selectedRole === 'Custom Role' && !customRole.trim()) return alert("Please enter a custom role.");
     
     // Core Bug Fix: Reset previous analytics states cleanly before starting
     setAnalysisReport({ overallScore: 0, summary: "Analyzing session data...", insights: "", breakdown: [] });
@@ -108,8 +110,11 @@ export default function SynapSiftScreener() {
     setCurrentStep('INTERVIEW');
     setIsAiThinking(true);
 
+    // Dynamic routing: use custom role string if "Custom Role" is selected
+    const finalRole = selectedRole === 'Custom Role' ? customRole.trim() : selectedRole;
+
     const formData = new FormData();
-    formData.append('role', selectedRole);
+    formData.append('role', finalRole);
     formData.append('resume', uploadedFile);
 
     try {
@@ -149,6 +154,8 @@ export default function SynapSiftScreener() {
     setInputAnswer('');
     setIsAiThinking(true);
 
+    const finalRole = selectedRole === 'Custom Role' ? customRole.trim() : selectedRole;
+
     try {
       const response = await fetch('http://127.0.0.1:8000/api/interview/chat', {
         method: 'POST',
@@ -159,7 +166,7 @@ export default function SynapSiftScreener() {
         body: JSON.stringify({
           interview_id: interviewId,
           message: candidateMsg.text,
-          role: selectedRole
+          role: finalRole
         })
       });
 
@@ -185,7 +192,7 @@ export default function SynapSiftScreener() {
 
   const handleTerminate = async () => {
     setCurrentStep('SUMMARY');
-    setIsEvaluating(true); // Core Bug Fix: Start the loading spinner cleanly
+    setIsEvaluating(true); 
     if (!interviewId || !userToken) return;
     
     try {
@@ -197,7 +204,7 @@ export default function SynapSiftScreener() {
     } catch (error) {
       console.error("Evaluation generation error:", error);
     } finally {
-      setIsEvaluating(false); // Remove loading layer once response is parsed
+      setIsEvaluating(false); 
     }
   };
 
@@ -259,13 +266,37 @@ export default function SynapSiftScreener() {
               <h2 className="text-2xl font-bold tracking-tight text-white">Initialize Assessment</h2>
               <p className="text-sm text-slate-400">Upload your resume to calibrate our dynamic evaluation engine.</p>
             </div>
+            
+            {/* TARGET PROFILE DROPDOWN */}
             <div className="space-y-2">
               <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2"><Briefcase size={14} className="text-indigo-400" /> Target Profile</label>
-              <select value={selectedRole} onChange={(e) => setSelectedRole(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:border-indigo-500 transition">
-                <option>AI/ML Engineering Intern</option>
+              <select 
+                value={selectedRole} 
+                onChange={(e) => {
+                  setSelectedRole(e.target.value);
+                  if (e.target.value !== 'Custom Role') setCustomRole('');
+                }} 
+                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:border-indigo-500 transition"
+              >
+                <option>AI / Machine Learning Role</option>
+                <option>Data Science / Applied ML Role</option>
+                <option>Advanced / Theoretical ML</option>
                 <option>Backend Engineering Intern</option>
+                <option>Custom Role</option>  
               </select>
+
+              {/* CUSTOM ROLE TEXT INPUT */}
+              {selectedRole === 'Custom Role' && (
+                <input 
+                  type="text" 
+                  placeholder="e.g., Cloud Security Architect..." 
+                  value={customRole} 
+                  onChange={(e) => setCustomRole(e.target.value)} 
+                  className="w-full bg-slate-950 border border-indigo-500/50 rounded-xl px-4 py-3 mt-3 text-slate-200 focus:outline-none focus:border-indigo-400 transition shadow-inner" 
+                />
+              )}
             </div>
+
             <div className="space-y-2">
               <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2"><Upload size={14} className="text-indigo-400" /> Professional Resume</label>
               <div className="border-2 border-dashed border-slate-800 hover:border-indigo-500/50 rounded-xl p-6 bg-slate-950/50 flex flex-col items-center justify-center gap-3 relative cursor-pointer group">
@@ -285,7 +316,7 @@ export default function SynapSiftScreener() {
             <div className="px-6 py-4 border-b border-slate-800 bg-slate-900/80 flex items-center justify-between">
               <div>
                 <h3 className="font-semibold text-sm text-white">Active Stream Evaluation</h3>
-                <p className="text-xs text-slate-400 truncate">Target: {selectedRole} | Matrix ID: <span className="font-mono">{interviewId || "Initializing..."}</span></p>
+                <p className="text-xs text-slate-400 truncate">Target: {selectedRole === 'Custom Role' ? customRole : selectedRole} | Matrix ID: <span className="font-mono">{interviewId || "Initializing..."}</span></p>
               </div>
               <button onClick={handleTerminate} className="text-xs bg-red-950 text-red-400 border border-red-900/50 px-3 py-1.5 rounded-lg hover:bg-red-900 hover:text-white transition">Terminate & Request Evaluation</button>
             </div>

@@ -11,12 +11,16 @@ LOCAL_QDRANT_PATH = "./qdrant_db"
 COLLECTION_NAME = "textbook_knowledge"
 
 ROLE_DOCS = {
-    "AI/ML Engineering Intern": "aiml_book.pdf",
-    "Backend Engineering Intern": "backend_book.pdf"
+    "AI / Machine Learning Role": "2019BurkovTheHundred-pageMachineLearning.pdf",
+    "Data Science / Applied ML Role": "Introduction to Machine Learning with Python ( PDFDrive.com )-min.pdf",
+    "Advanced / Theoretical ML": "Bishop-Pattern-Recognition-and-Machine-Learning-2006.pdf",
+    "Backend Engineering Intern": "Introduction to Machine Learning with Python ( PDFDrive.com )-min.pdf" 
 }
 
 def ingest_all_knowledge():
     print("💾 Connecting to Qdrant Vector Engine...")
+    
+    # We open ONE single client connection to control the database
     client = QdrantClient(path=LOCAL_QDRANT_PATH)
 
     # Wipe the old development database to ensure a clean, fresh architecture
@@ -67,14 +71,18 @@ def ingest_all_knowledge():
         print("\n❌ Error: No textbook data chunks were processed. Place the PDFs in the folder.")
         return
 
-    # 3. Commit everything to the Vector Database
+    # 3. Commit everything to the Vector Database Safely
     print(f"\n⏳ Embedding and writing {len(all_processed_chunks)} total chunks to Qdrant. This takes a minute...")
-    QdrantVectorStore.from_documents(
-        documents=all_processed_chunks,
-        embedding=embeddings,
+    
+    #Initialize the vector store using the exact client we already opened
+    vector_store = QdrantVectorStore(
+        client=client,
         collection_name=COLLECTION_NAME,
-        url=LOCAL_QDRANT_PATH,
+        embedding=embeddings,
     )
+    
+    #Add the documents safely through our open connection
+    vector_store.add_documents(documents=all_processed_chunks)
 
     print("\n🚀 Advanced Metadata-Filtered RAG Ingestion Complete!")
 
