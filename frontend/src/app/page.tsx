@@ -1,9 +1,9 @@
 "use client";
 
 import React, { useState, useEffect } from 'react';
-import { Upload, Briefcase, Play, Send, CheckCircle, AlertCircle, RefreshCw, Network, Lock, User, LogOut } from 'lucide-react';
+import { Upload, Briefcase, Play, Send, CheckCircle, AlertCircle, RefreshCw, Network, Lock, User, LogOut, Users, FileText, Trash2, UserX } from 'lucide-react';
 
-type Step = 'AUTH' | 'SETUP' | 'INTERVIEW' | 'SUMMARY';
+type Step = 'AUTH' | 'SETUP' | 'INTERVIEW' | 'SUMMARY' | 'ADMIN';
 
 interface Message {
   id: string;
@@ -19,17 +19,28 @@ interface QAAnalysis {
   feedback: string;
 }
 
+interface CandidateRecord {
+  name: string;
+  email: string;
+  interview_id: string;
+  role: string;
+  status: string;
+  date: string;
+}
+
 export default function SynapSiftScreener() {
-  // Auth & Session States
   const [currentStep, setCurrentStep] = useState<Step>('AUTH');
   const [isLogin, setIsLogin] = useState<boolean>(true);
   const [authName, setAuthName] = useState<string>('');
   const [authEmail, setAuthEmail] = useState<string>('');
   const [authPassword, setAuthPassword] = useState<string>('');
+  const [authRole, setAuthRole] = useState<string>('candidate');
+  const [adminCode, setAdminCode] = useState<string>('');
+  
   const [userToken, setUserToken] = useState<string | null>(null);
   const [userName, setUserName] = useState<string>('');
+  const [userRole, setUserRole] = useState<string>('');
 
-  // Interview States
   const [selectedRole, setSelectedRole] = useState('AI / Machine Learning Role');
   const [customRole, setCustomRole] = useState(''); 
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
@@ -39,21 +50,26 @@ export default function SynapSiftScreener() {
   const [interviewId, setInterviewId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
 
+  const [candidates, setCandidates] = useState<CandidateRecord[]>([]);
   const [analysisReport, setAnalysisReport] = useState<{ overallScore: number; summary: string; insights: string; breakdown: QAAnalysis[]; }>({
-    overallScore: 0,
-    summary: "",
-    insights: "",
-    breakdown: []
+    overallScore: 0, summary: "", insights: "", breakdown: []
   });
 
-  // Check for existing session token on load
   useEffect(() => {
     const token = localStorage.getItem("synapsift_token");
     const name = localStorage.getItem("synapsift_name");
-    if (token && name) {
+    const role = localStorage.getItem("synapsift_role");
+    
+    if (token && name && role) {
       setUserToken(token);
       setUserName(name);
-      setCurrentStep('SETUP');
+      setUserRole(role);
+      if (role === 'admin') {
+        setCurrentStep('ADMIN');
+        fetchCandidates(token);
+      } else {
+        setCurrentStep('SETUP');
+      }
     }
   }, []);
 
@@ -61,7 +77,61 @@ export default function SynapSiftScreener() {
     localStorage.clear();
     setUserToken(null);
     setUserName('');
+    setUserRole('');
     setCurrentStep('AUTH');
+  };
+
+  const handleDeleteAccount = async () => {
+    if (!confirm("Are you sure you want to permanently delete your account and all history? This cannot be undone.")) return;
+    try {
+      const response = await fetch('http://127.0.0.1:8000/api/user/account', {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${userToken}` }
+      });
+      if (response.ok) handleLogOut();
+    } catch (error) {
+      console.error("Failed to delete account", error);
+    }
+  };
+
+  const handleAdminDeleteInterview = async (id: string) => {
+    if (!confirm("Delete this candidate's interview record permanently?")) return;
+    try {
+      const response = await fetch(`http://127.0.0.1:8000/api/admin/interview/${id}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${userToken}` }
+      });
+      if (response.ok) fetchCandidates(userToken!);
+    } catch (error) {
+      console.error("Failed to delete interview", error);
+    }
+  };
+
+  const handleAbortSession = async () => {
+    if (!confirm("WARNING: Are you sure you want to exit? This interview will NOT be saved or graded, and all progress will be permanently lost.")) return;
+    try {
+      await fetch(`http://127.0.0.1:8000/api/interview/abort/${interviewId}`, {
+        method: 'DELETE',
+        headers: { 'Authorization': `Bearer ${userToken}` }
+      });
+      setUploadedFile(null);
+      setMessages([]);
+      setInterviewId(null);
+      setCurrentStep('SETUP');
+    } catch (error) {
+      console.error("Failed to abort session", error);
+    }
+  };
+
+  const fetchCandidates = async (token: string) => {
+    try {
+      const response = await fetch('http://127.0.0.1:8000/api/admin/candidates', {
+        headers: { 'Authorization': `Bearer ${token}` }
+      });
+      if (response.ok) setCandidates(await response.json());
+    } catch (error) {
+      console.error("Failed to fetch admin data", error);
+    }
   };
 
   const handleAuthSubmit = async (e: React.FormEvent) => {
@@ -69,7 +139,7 @@ export default function SynapSiftScreener() {
     const endpoint = isLogin ? '/api/auth/login' : '/api/auth/signup';
     const payload = isLogin 
       ? { email: authEmail, password: authPassword }
-      : { name: authName, email: authEmail, password: authPassword, role: 'candidate' };
+      : { name: authName, email: authEmail, password: authPassword, role: authRole, admin_code: adminCode };
 
     try {
       const response = await fetch(`http://127.0.0.1:8000${endpoint}`, {
@@ -77,16 +147,24 @@ export default function SynapSiftScreener() {
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(payload)
       });
-
       const data = await response.json();
       if (!response.ok) return alert(data.detail || "Authentication failed");
 
       if (isLogin) {
         localStorage.setItem("synapsift_token", data.token);
         localStorage.setItem("synapsift_name", data.name);
+        localStorage.setItem("synapsift_role", data.role);
+        
         setUserToken(data.token);
         setUserName(data.name);
-        setCurrentStep('SETUP');
+        setUserRole(data.role);
+        
+        if (data.role === 'admin') {
+          setCurrentStep('ADMIN');
+          fetchCandidates(data.token);
+        } else {
+          setCurrentStep('SETUP');
+        }
       } else {
         alert("Registration complete! Please log in.");
         setIsLogin(true);
@@ -101,20 +179,16 @@ export default function SynapSiftScreener() {
   };
 
   const startSession = async () => {
-    if (!uploadedFile || !userToken) return alert("Please upload a resume file to calibrate context.");
+    if (!uploadedFile || !userToken) return alert("Please upload a resume file.");
     if (selectedRole === 'Custom Role' && !customRole.trim()) return alert("Please enter a custom role.");
     
-    // Core Bug Fix: Reset previous analytics states cleanly before starting
     setAnalysisReport({ overallScore: 0, summary: "Analyzing session data...", insights: "", breakdown: [] });
     setMessages([]); 
     setCurrentStep('INTERVIEW');
     setIsAiThinking(true);
 
-    // Dynamic routing: use custom role string if "Custom Role" is selected
-    const finalRole = selectedRole === 'Custom Role' ? customRole.trim() : selectedRole;
-
     const formData = new FormData();
-    formData.append('role', finalRole);
+    formData.append('role', selectedRole === 'Custom Role' ? customRole.trim() : selectedRole);
     formData.append('resume', uploadedFile);
 
     try {
@@ -123,18 +197,11 @@ export default function SynapSiftScreener() {
         headers: { 'Authorization': `Bearer ${userToken}` },
         body: formData,
       });
-      
       const data = await response.json();
       setInterviewId(data.interview_id);
-      
-      setMessages([{
-        id: Date.now().toString(),
-        sender: 'ai',
-        text: data.first_question,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      }]);
+      setMessages([{ id: Date.now().toString(), sender: 'ai', text: data.first_question, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
     } catch (error) {
-      console.error("Error launching interview matrix pipeline:", error);
+      console.error(error);
     } finally {
       setIsAiThinking(false);
     }
@@ -143,66 +210,45 @@ export default function SynapSiftScreener() {
   const handleSendAnswer = async () => {
     if (!inputAnswer.trim() || !interviewId || !userToken) return;
 
-    const candidateMsg: Message = {
-      id: Date.now().toString(),
-      sender: 'candidate',
-      text: inputAnswer,
-      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-    };
-
+    const candidateMsg: Message = { id: Date.now().toString(), sender: 'candidate', text: inputAnswer, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) };
     setMessages((prev) => [...prev, candidateMsg]);
     setInputAnswer('');
     setIsAiThinking(true);
 
-    const finalRole = selectedRole === 'Custom Role' ? customRole.trim() : selectedRole;
-
     try {
       const response = await fetch('http://127.0.0.1:8000/api/interview/chat', {
         method: 'POST',
-        headers: { 
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${userToken}`
-        },
-        body: JSON.stringify({
-          interview_id: interviewId,
-          message: candidateMsg.text,
-          role: finalRole
-        })
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${userToken}` },
+        body: JSON.stringify({ interview_id: interviewId, message: candidateMsg.text, role: selectedRole === 'Custom Role' ? customRole.trim() : selectedRole })
       });
-
       const data = await response.json();
       
-      setMessages((prev) => [...prev, {
-        id: (Date.now() + 1).toString(),
-        sender: 'ai',
-        text: data.reply,
-        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      }]);
+      setMessages((prev) => [...prev, { id: (Date.now() + 1).toString(), sender: 'ai', text: data.reply, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
 
-      // Automated Termination State Engine
       if (data.status === 'COMPLETED') {
         setTimeout(() => handleTerminate(), 1500);
       }
     } catch (error) {
-      console.error("Chat error:", error);
+      console.error(error);
     } finally {
       setIsAiThinking(false);
     }
   };
 
-  const handleTerminate = async () => {
+  const handleTerminate = async (specificId?: string) => {
+    const idToFetch = specificId || interviewId;
+    if (!idToFetch || !userToken) return;
+    
     setCurrentStep('SUMMARY');
     setIsEvaluating(true); 
-    if (!interviewId || !userToken) return;
     
     try {
-      const response = await fetch(`http://127.0.0.1:8000/api/interview/summary/${interviewId}`, {
+      const response = await fetch(`http://127.0.0.1:8000/api/interview/summary/${idToFetch}`, {
         headers: { 'Authorization': `Bearer ${userToken}` }
       });
-      const data = await response.json();
-      setAnalysisReport(data);
+      setAnalysisReport(await response.json());
     } catch (error) {
-      console.error("Evaluation generation error:", error);
+      console.error(error);
     } finally {
       setIsEvaluating(false); 
     }
@@ -219,9 +265,14 @@ export default function SynapSiftScreener() {
         </div>
         
         {userToken && (
-          <div className="flex items-center gap-4">
-            <span className="text-xs text-slate-400">Candidate: <strong className="text-slate-200">{userName}</strong></span>
-            <button onClick={handleLogOut} className="text-slate-400 hover:text-red-400 transition flex items-center gap-1.5 text-xs"><LogOut size={14} /> Log Out</button>
+          <div className="flex items-center gap-5">
+            <span className="text-xs text-slate-400">
+              {userRole === 'admin' ? 'Admin:' : 'Candidate:'} <strong className="text-slate-200">{userName}</strong>
+            </span>
+            <div className="flex items-center gap-3 border-l border-slate-700 pl-4">
+              <button onClick={handleDeleteAccount} className="text-slate-400 hover:text-red-400 transition flex items-center gap-1.5 text-xs"><UserX size={14} /> Delete Account</button>
+              <button onClick={handleLogOut} className="text-slate-400 hover:text-white transition flex items-center gap-1.5 text-xs"><LogOut size={14} /> Log Out</button>
+            </div>
           </div>
         )}
       </header>
@@ -230,15 +281,30 @@ export default function SynapSiftScreener() {
         {currentStep === 'AUTH' && (
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 max-w-md w-full mx-auto shadow-2xl space-y-6">
             <div className="text-center space-y-1.5">
-              <h2 className="text-2xl font-bold tracking-tight text-white">{isLogin ? "Welcome Back" : "Create Gateway Account"}</h2>
-              <p className="text-xs text-slate-400">Enter fake credentials to initialize the gateway nodes.</p>
+              <h2 className="text-2xl font-bold tracking-tight text-white">{isLogin ? "System Login" : "Create Account"}</h2>
+              <p className="text-xs text-slate-400">Authenticate to access the SynapSift platform.</p>
             </div>
             <form onSubmit={handleAuthSubmit} className="space-y-4">
               {!isLogin && (
-                <div className="space-y-1.5">
-                  <label className="text-xs font-medium text-slate-400 flex items-center gap-1.5"><User size={13} /> Full Name</label>
-                  <input type="text" required value={authName} onChange={(e) => setAuthName(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500" placeholder="John Doe" />
-                </div>
+                <>
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-medium text-slate-400 flex items-center gap-1.5"><User size={13} /> Full Name</label>
+                    <input type="text" required value={authName} onChange={(e) => setAuthName(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500" placeholder="John Doe" />
+                  </div>
+                  <div className="space-y-1.5">
+                    <label className="text-xs font-medium text-slate-400 flex items-center gap-1.5"><Briefcase size={13} /> Account Type</label>
+                    <select value={authRole} onChange={(e) => { setAuthRole(e.target.value); setAdminCode(''); }} className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500">
+                      <option value="candidate">Candidate (Take Interview)</option>
+                      <option value="admin">Administrator (Review Results)</option>
+                    </select>
+                  </div>
+                  {authRole === 'admin' && (
+                    <div className="space-y-1.5">
+                      <label className="text-xs font-medium text-indigo-400 flex items-center gap-1.5"><Lock size={13} /> Admin Access Code</label>
+                      <input type="text" required value={adminCode} onChange={(e) => setAdminCode(e.target.value)} className="w-full bg-slate-950 border border-indigo-500/50 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-400 shadow-inner" placeholder="Enter recruiter code..." />
+                    </div>
+                  )}
+                </>
               )}
               <div className="space-y-1.5">
                 <label className="text-xs font-medium text-slate-400 flex items-center gap-1.5">@ Virtual Email</label>
@@ -249,14 +315,72 @@ export default function SynapSiftScreener() {
                 <input type="password" required value={authPassword} onChange={(e) => setAuthPassword(e.target.value)} className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-2.5 text-sm text-slate-200 focus:outline-none focus:border-indigo-500" placeholder="••••••••" />
               </div>
               <button type="submit" className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white font-medium rounded-xl text-sm transition shadow-lg shadow-indigo-600/25 mt-2">
-                {isLogin ? "Authenticate Credentials" : "Register Credentials"}
+                {isLogin ? "Authenticate Credentials" : "Register Account"}
               </button>
             </form>
             <div className="text-center">
               <button onClick={() => setIsLogin(!isLogin)} className="text-xs text-indigo-400 hover:underline bg-transparent border-none">
-                {isLogin ? "Need a candidate account? Register here" : "Already have credentials? Log in"}
+                {isLogin ? "Need an account? Register here" : "Already have an account? Log in"}
               </button>
             </div>
+          </div>
+        )}
+
+        {currentStep === 'ADMIN' && (
+          <div className="space-y-6 w-full max-w-5xl mx-auto py-4">
+             <div className="flex items-center justify-between">
+                <div>
+                  <h2 className="text-2xl font-bold text-white flex items-center gap-2"><Users className="text-indigo-400" /> Candidate Pipeline</h2>
+                  <p className="text-sm text-slate-400 mt-1">Review completed and ongoing technical assessments.</p>
+                </div>
+                <button onClick={() => fetchCandidates(userToken!)} className="flex items-center gap-2 text-xs bg-slate-900 border border-slate-800 px-4 py-2 rounded-xl hover:bg-slate-800 transition">
+                  <RefreshCw size={14} /> Refresh Data
+                </button>
+             </div>
+             
+             <div className="bg-slate-900 border border-slate-800 rounded-2xl overflow-hidden shadow-xl">
+                <table className="w-full text-left text-sm text-slate-300">
+                  <thead className="bg-slate-950/50 text-xs uppercase text-slate-500 border-b border-slate-800">
+                    <tr>
+                      <th className="px-6 py-4 font-medium">Candidate Name</th>
+                      <th className="px-6 py-4 font-medium">Email</th>
+                      <th className="px-6 py-4 font-medium">Target Role</th>
+                      <th className="px-6 py-4 font-medium">Status</th>
+                      <th className="px-6 py-4 font-medium text-right">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-800/50">
+                    {candidates.length === 0 ? (
+                      <tr><td colSpan={5} className="px-6 py-8 text-center text-slate-500">No candidate records found.</td></tr>
+                    ) : (
+                      candidates.map((c) => (
+                        <tr key={c.interview_id} className="hover:bg-slate-800/20 transition group">
+                          <td className="px-6 py-4 font-medium text-white">{c.name}</td>
+                          <td className="px-6 py-4 text-slate-400">{c.email}</td>
+                          <td className="px-6 py-4 text-indigo-300">{c.role}</td>
+                          <td className="px-6 py-4">
+                            <span className={`px-2.5 py-1 rounded-full text-xs font-medium ${c.status === 'COMPLETED' ? 'bg-emerald-500/10 text-emerald-400' : 'bg-yellow-500/10 text-yellow-400'}`}>
+                              {c.status}
+                            </span>
+                          </td>
+                          <td className="px-6 py-4 flex items-center justify-end">
+                            {c.status === 'COMPLETED' ? (
+                              <button onClick={() => handleTerminate(c.interview_id)} className="text-xs bg-indigo-600 hover:bg-indigo-500 text-white px-3 py-1.5 rounded-lg transition flex items-center gap-1.5">
+                                <FileText size={12} /> View Report
+                              </button>
+                            ) : (
+                              <span className="text-xs text-slate-500 px-3">In Progress</span>
+                            )}
+                            <button onClick={() => handleAdminDeleteInterview(c.interview_id)} className="text-xs bg-red-950 hover:bg-red-900 text-red-400 px-3 py-1.5 rounded-lg transition flex items-center gap-1.5 ml-2 opacity-0 group-hover:opacity-100" title="Reject / Delete Record">
+                              <Trash2 size={14} />
+                            </button>
+                          </td>
+                        </tr>
+                      ))
+                    )}
+                  </tbody>
+                </table>
+             </div>
           </div>
         )}
 
@@ -267,33 +391,17 @@ export default function SynapSiftScreener() {
               <p className="text-sm text-slate-400">Upload your resume to calibrate our dynamic evaluation engine.</p>
             </div>
             
-            {/* TARGET PROFILE DROPDOWN */}
             <div className="space-y-2">
               <label className="text-xs font-semibold uppercase tracking-wider text-slate-400 flex items-center gap-2"><Briefcase size={14} className="text-indigo-400" /> Target Profile</label>
-              <select 
-                value={selectedRole} 
-                onChange={(e) => {
-                  setSelectedRole(e.target.value);
-                  if (e.target.value !== 'Custom Role') setCustomRole('');
-                }} 
-                className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:border-indigo-500 transition"
-              >
+              <select value={selectedRole} onChange={(e) => { setSelectedRole(e.target.value); if (e.target.value !== 'Custom Role') setCustomRole(''); }} className="w-full bg-slate-950 border border-slate-800 rounded-xl px-4 py-3 text-slate-200 focus:outline-none focus:border-indigo-500 transition">
                 <option>AI / Machine Learning Role</option>
                 <option>Data Science / Applied ML Role</option>
                 <option>Advanced / Theoretical ML</option>
                 <option>Backend Engineering Intern</option>
                 <option>Custom Role</option>  
               </select>
-
-              {/* CUSTOM ROLE TEXT INPUT */}
               {selectedRole === 'Custom Role' && (
-                <input 
-                  type="text" 
-                  placeholder="e.g., Cloud Security Architect..." 
-                  value={customRole} 
-                  onChange={(e) => setCustomRole(e.target.value)} 
-                  className="w-full bg-slate-950 border border-indigo-500/50 rounded-xl px-4 py-3 mt-3 text-slate-200 focus:outline-none focus:border-indigo-400 transition shadow-inner" 
-                />
+                <input type="text" placeholder="e.g., Cloud Security Architect..." value={customRole} onChange={(e) => setCustomRole(e.target.value)} className="w-full bg-slate-950 border border-indigo-500/50 rounded-xl px-4 py-3 mt-3 text-slate-200 focus:outline-none focus:border-indigo-400 transition shadow-inner" />
               )}
             </div>
 
@@ -318,7 +426,11 @@ export default function SynapSiftScreener() {
                 <h3 className="font-semibold text-sm text-white">Active Stream Evaluation</h3>
                 <p className="text-xs text-slate-400 truncate">Target: {selectedRole === 'Custom Role' ? customRole : selectedRole} | Matrix ID: <span className="font-mono">{interviewId || "Initializing..."}</span></p>
               </div>
-              <button onClick={handleTerminate} className="text-xs bg-red-950 text-red-400 border border-red-900/50 px-3 py-1.5 rounded-lg hover:bg-red-900 hover:text-white transition">Terminate & Request Evaluation</button>
+              <div className="flex gap-3">
+                <button onClick={handleAbortSession} className="text-xs bg-slate-950 text-slate-400 border border-slate-800 px-3 py-1.5 rounded-lg hover:bg-red-950 hover:text-red-400 transition">
+                  Abort Session
+                </button>
+              </div>
             </div>
             <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-slate-950/30">
               {messages.map((msg) => (
@@ -336,7 +448,19 @@ export default function SynapSiftScreener() {
             </div>
             <div className="p-4 border-t border-slate-800 bg-slate-900">
               <div className="flex items-center gap-3 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2 focus-within:border-indigo-500 transition">
-                <input type="text" placeholder="Formulate your technical response..." value={inputAnswer} onChange={(e) => setInputAnswer(e.target.value)} onKeyDown={(e) => e.key === 'Enter' && handleSendAnswer()} className="flex-1 bg-transparent border-none text-sm text-slate-200 focus:outline-none py-2" />
+                <textarea 
+                  placeholder="Formulate your technical response..." 
+                  value={inputAnswer} 
+                  onChange={(e) => setInputAnswer(e.target.value)} 
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' && !e.shiftKey) {
+                      e.preventDefault();
+                      handleSendAnswer();
+                    }
+                  }} 
+                  className="flex-1 bg-transparent border-none text-sm text-slate-200 focus:outline-none py-2 resize-none min-h-[44px] max-h-32 overflow-y-auto" 
+                  rows={1}
+                />
                 <button onClick={handleSendAnswer} className="p-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition"><Send size={14} /></button>
               </div>
             </div>
@@ -387,13 +511,14 @@ export default function SynapSiftScreener() {
             )}
 
             {!isEvaluating && (
-              <div className="flex justify-end">
-                <button 
-                  onClick={() => { setUploadedFile(null); setCurrentStep('SETUP'); }}
-                  className="flex items-center gap-2 text-xs bg-slate-900 text-slate-300 border border-slate-800 px-4 py-2 rounded-xl hover:bg-slate-800 hover:text-white transition"
-                >
-                  <RefreshCw size={12} /> Start New Session
-                </button>
+              <div className="flex justify-end gap-3">
+                {userRole === 'admin' ? (
+                   <button onClick={() => setCurrentStep('ADMIN')} className="flex items-center gap-2 text-xs bg-indigo-600 text-white px-4 py-2 rounded-xl hover:bg-indigo-500 transition">Back to Dashboard</button>
+                ) : (
+                  <button onClick={() => { setUploadedFile(null); setCurrentStep('SETUP'); }} className="flex items-center gap-2 text-xs bg-slate-900 text-slate-300 border border-slate-800 px-4 py-2 rounded-xl hover:bg-slate-800 hover:text-white transition">
+                    <RefreshCw size={12} /> Start New Session
+                  </button>
+                )}
               </div>
             )}
           </div>

@@ -98,7 +98,7 @@ def generate_ai_response(messages: list) -> str:
 
     try:
         print("🤖 Querying Local Mistral Node via Ollama standard pipeline...")
-        with httpx.Client(timeout=120.0) as client:
+        with httpx.Client(timeout=300.0) as client:
             ollama_response = client.post(
                 "http://127.0.0.1:11434/api/generate",
                 json={
@@ -147,6 +147,7 @@ class SignUpRequest(BaseModel):
     email: EmailStr
     password: str
     role: str
+    admin_code: str | None = None  # Add this new field
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -171,6 +172,8 @@ def get_current_user(authorization: str = Header(None)):
 
 @app.post("/api/auth/signup")
 async def signup(user: SignUpRequest):
+    if user.role == "admin" and user.admin_code != "PGAGI-RECRUITER-2026":
+        raise HTTPException(status_code=403, detail="Invalid or missing Admin Access Code")
     conn = sqlite3.connect("synapsift.db")
     cursor = conn.cursor()
     salt = bcrypt.gensalt()
@@ -269,17 +272,18 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
     cursor.execute("INSERT INTO messages (interview_id, sender, text_content) VALUES (?, 'candidate', ?)", 
                   (payload.interview_id, payload.message))
     conn.commit()
-    
-    if turns_taken >= 3: 
+
+    if turns_taken >= 15:
+        closing_msg = "Thank you for your extensive responses. The session is now concluded."
+        cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk) VALUES (?, 'ai', ?, ?)", 
+                      (payload.interview_id, closing_msg, "System Hard Stop"))
         cursor.execute("UPDATE interviews SET status = 'COMPLETED' WHERE id = ?", (payload.interview_id,))
         conn.commit()
         conn.close()
-        return {"reply": "Thank you. We have completed all technical validation tracks for this session. Compiling core analytics metrics...", "status": "COMPLETED"}
+        return {"reply": closing_msg, "status": "COMPLETED"}
 
-    # Dynamic Query Formulation: Prevent searching for "I don't know"
     search_query = payload.message if len(payload.message) > 15 else f"Advanced interview concepts for {payload.role}"
     
-    # 🌟 MULTI-TIER RAG FALLBACK SYSTEM 🌟
     try:
         docs = vector_db.similarity_search(search_query, k=1, filter={"target_role": payload.role})
     except Exception:
@@ -290,28 +294,42 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
         
     rag_context = docs[0].page_content if docs else "Core computer systems engineering."
 
+    # --- MISTRAL-PROOF PROMPT ---
     prompt = HumanMessage(
-        content=f"""You are a strict, professional technical interviewer for a {payload.role} role.
-        Textbook Reference: {rag_context}
-        Candidate responded: "{payload.message}"
+        content=f"""You are a cold, strict interviewer for a {payload.role} role.
+        Candidate's last answer: "{payload.message}"
+        Next question context: {rag_context}
         
-        Instructions:
-        - If candidate says 'I don't know' or requests help: Explain the concept in EXACTLY ONE sentence. Then ask a NEW technical question based on the textbook reference.
-        - If they answered technically: Do NOT evaluate them out loud. Immediately ask the next technical question based on the textbook reference.
+        RULES (FOLLOW EXACTLY):
+        1. DO NOT evaluate the candidate out loud. NEVER say "The candidate has provided..." or "Good answer."
+        2. DO NOT mention the "Textbook" or "Context".
+        3. Simply output the VERY NEXT technical question you want to ask.
+        4. If the candidate says "I don't know", give a 1-sentence answer, then ask a new question.
         
-        CRITICAL RULES:
-        - MAXIMUM 2 SENTENCES TOTAL.
-        - NEVER use conversational filler like "Alright, let's discuss..." or "Now, let's move on".
-        - Be direct and professional."""
+        TERMINATION:
+        If the candidate proves they have NO knowledge across multiple questions, OR if they have answered perfectly and you are satisfied, YOU MUST END THE INTERVIEW. 
+        To end it, do NOT ask a question. Output ONLY this exact string: "[TERMINATE]"
+        
+        OUTPUT EXACTLY WHAT YOU WILL SPEAK. NO OTHER TEXT."""
     )
     next_question = generate_ai_response([prompt])
 
+    is_completed = False
+    if "[TERMINATE]" in next_question or turns_taken >= 10:
+        # Strip out any ghost questions Mistral tried to sneak in
+        next_question = "Thank you for your responses today. We have gathered sufficient data to conclude this technical screening.\n\n*(Session gracefully terminated by AI based on candidate assessment. Compiling analytics...)*"
+        is_completed = True
+
     cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk) VALUES (?, 'ai', ?, ?)", 
                   (payload.interview_id, next_question, rag_context))
+    
+    if is_completed:
+        cursor.execute("UPDATE interviews SET status = 'COMPLETED' WHERE id = ?", (payload.interview_id,))
+        
     conn.commit()
     conn.close()
 
-    return {"reply": next_question, "status": "ONGOING"}
+    return {"reply": next_question, "status": "COMPLETED" if is_completed else "ONGOING"}
 
 @app.get("/api/interview/summary/{interview_id}")
 async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get_current_user)):
@@ -339,39 +357,46 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
 
     verification_payload = json.dumps(qa_pairs, indent=2)
     
+    # --- MISTRAL-PROOF JSON PROMPT ---
     prompt = HumanMessage(
-        content=f"""You are an elite technical evaluator grading an interview.
-        
-        Q&A Transcript:
+        content=f"""Analyze this technical interview transcript:
         {verification_payload}
         
-        CRITICAL INSTRUCTION: Output ONLY a valid JSON object. Do not include markdown backticks (```) or any introductory text.
+        Evaluate the candidate and output ONLY a valid JSON object matching this exact structure. NO markdown formatting. NO conversational text.
         
-        YOU MUST EXACTLY MATCH THIS TEMPLATE FORMAT:
         {{
-            "overallScore": 75,
-            "summary": "Candidate showed some knowledge but struggled with deep technical concepts.",
-            "insights": "Strengths: Basic understanding. Weaknesses: Core algorithms.",
+            "overallScore": 85,
+            "summary": "2 sentence overall summary.",
+            "insights": "Strengths: X. Weaknesses: Y.",
             "breakdown": [
                 {{
-                    "question": "The interviewer's question here",
-                    "answer": "The candidate's answer here",
-                    "score": 0,
-                    "feedback": "Candidate failed to define the concept."
+                    "question": "The question asked",
+                    "answer": "The candidate's answer",
+                    "score": 90,
+                    "feedback": "1 sentence feedback."
                 }}
             ]
         }}"""
     )
     response_text = generate_ai_response([prompt])
     
+    # --- BULLETPROOF REGEX JSON EXTRACTOR ---
     try:
-        clean_text = response_text.replace("```json", "").replace("```", "").strip()
-        start_idx = clean_text.find('{')
-        end_idx = clean_text.rfind('}')
-        
-        if start_idx != -1 and end_idx != -1:
-            json_str = clean_text[start_idx:end_idx+1]
-            return json.loads(json_str)
+        # Find everything between the first { and the last }
+        match = re.search(r'\{.*\}', response_text, re.DOTALL)
+        if match:
+            json_str = match.group(0)
+            parsed_json = json.loads(json_str)
+            
+            # Update the relational DB with the final score
+            conn = sqlite3.connect("synapsift.db")
+            cursor = conn.cursor()
+            cursor.execute("UPDATE interviews SET overall_score = ?, evaluation_summary = ? WHERE id = ?", 
+                          (parsed_json.get("overallScore", 0), parsed_json.get("summary", ""), interview_id))
+            conn.commit()
+            conn.close()
+            
+            return parsed_json
         else:
             raise ValueError("No JSON boundaries found.")
             
@@ -379,7 +404,7 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
         print(f"JSON Parsing Failed: {e}. Raw Response: {response_text}")
         return {
             "overallScore": 50, 
-            "summary": "AI Evaluation encountered formatting restrictions. Raw data preserved.",
+            "summary": "AI Evaluation encountered formatting restrictions due to local model limits. Raw data preserved.",
             "insights": "Candidate completed all questions, but LLM analytics engine failed to parse insights.",
             "breakdown": [{"question": p["question"], "answer": p["answer"], "score": 50, "feedback": "Logs saved for manual review."} for p in qa_pairs]
         }
@@ -404,3 +429,47 @@ async def get_all_candidates(user_meta: dict = Depends(get_current_user)):
         {"name": r[0], "email": r[1], "interview_id": r[2], "role": r[3], "status": r[4], "date": r[5]} 
         for r in rows
     ]
+
+@app.delete("/api/user/account")
+async def delete_account(user_meta: dict = Depends(get_current_user)):
+    conn = sqlite3.connect("synapsift.db")
+    cursor = conn.cursor()
+    user_id = user_meta["user_id"]
+    
+    # Cascade delete: Messages -> Interviews -> User
+    cursor.execute("DELETE FROM messages WHERE interview_id IN (SELECT id FROM interviews WHERE user_id = ?)", (user_id,))
+    cursor.execute("DELETE FROM interviews WHERE user_id = ?", (user_id,))
+    cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
+    
+    conn.commit()
+    conn.close()
+    return {"message": "Account permanently deleted"}
+
+@app.delete("/api/admin/interview/{interview_id}")
+async def delete_interview(interview_id: str, user_meta: dict = Depends(get_current_user)):
+    if user_meta.get("role") != "admin":
+        raise HTTPException(status_code=403, detail="Access denied: Admin credentials required")
+        
+    conn = sqlite3.connect("synapsift.db")
+    cursor = conn.cursor()
+    
+    # Admin rejecting/deleting a candidate's record
+    cursor.execute("DELETE FROM messages WHERE interview_id = ?", (interview_id,))
+    cursor.execute("DELETE FROM interviews WHERE id = ?", (interview_id,))
+    
+    conn.commit()
+    conn.close()
+    return {"message": "Candidate record wiped"}
+
+@app.delete("/api/interview/abort/{interview_id}")
+async def abort_interview(interview_id: str, user_meta: dict = Depends(get_current_user)):
+    conn = sqlite3.connect("synapsift.db")
+    cursor = conn.cursor()
+    
+    # Security: Ensure the candidate actually owns the interview they are aborting
+    cursor.execute("DELETE FROM messages WHERE interview_id = ?", (interview_id,))
+    cursor.execute("DELETE FROM interviews WHERE id = ? AND user_id = ?", (interview_id, user_meta["user_id"]))
+    
+    conn.commit()
+    conn.close()
+    return {"message": "Interview aborted. Data wiped from system."}
