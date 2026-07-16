@@ -14,6 +14,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
+from langchain_openai import ChatOpenAI
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_core.messages import HumanMessage
 from langchain_huggingface import HuggingFaceEmbeddings
@@ -26,6 +27,7 @@ from langchain_text_splitters import RecursiveCharacterTextSplitter
 load_dotenv()
 PRIMARY_KEY = os.getenv("GEMINI_API_KEY")
 BACKUP_KEY = os.getenv("GEMINI_BACKUP_API_KEY")
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY")
 JWT_SECRET = os.getenv("JWT_SECRET", "super_secret_synapsift_key_2026")
 JWT_ALGORITHM = "HS256"
 
@@ -85,9 +87,10 @@ def init_relational_db():
 
 init_relational_db()
 
-# 3. Hybrid AI Engine: Gemini + Local Ollama Mistral Fallback
-def generate_ai_response(messages: list) -> str:
-    model_name = "gemini-3.5-flash"
+# 3. Hybrid AI Engine: OpenRouter (Chat) + Gemini 3.5 (Eval) + Local Ollama
+def generate_ai_response(messages: list, task_type: str = "chat") -> str:
+    # Look, I remembered my own version this time!
+    gemini_model = "gemini-3.5-flash"
     
     def extract_text(content):
         if isinstance(content, list):
@@ -97,35 +100,82 @@ def generate_ai_response(messages: list) -> str:
 
     raw_prompt_string = "\n".join([str(m.content) for m in messages])
 
-    try:
-        llm = ChatGoogleGenerativeAI(model=model_name, google_api_key=PRIMARY_KEY)
-        response = llm.invoke(messages)
-        return extract_text(response.content)
-    except Exception as e_primary:
-        print(f"⚠️ Primary API failed: {e_primary}. Transitioning to Backup Key...")
-        try:
-            if BACKUP_KEY:
-                llm_backup = ChatGoogleGenerativeAI(model=model_name, google_api_key=BACKUP_KEY)
-                backup_response = llm_backup.invoke(messages)
-                return extract_text(backup_response.content)
-        except Exception as e_backup:
-            print(f"⚠️ Backup API failed: {e_backup}. Activating Local Ollama Infrastructure...")
+    # --- TASK: INTERVIEW CHAT (Strictly Free APIs + Local) ---
+    if task_type == "chat":
+        if OPENROUTER_API_KEY:
+            try:
+                print("🌐 Querying OpenRouter (NVIDIA Nemotron 30B Free) for Chat...")
+                llm_openrouter = ChatOpenAI(
+                    model="nvidia/nemotron-3-nano-30b-a3b:free", 
+                    api_key=OPENROUTER_API_KEY,
+                    base_url="https://openrouter.ai/api/v1"
+                )
+                response = llm_openrouter.invoke(messages)
+                res_text = extract_text(response.content).strip()
+                
+                # --- THE BLANK TEXT GUARDRAIL ---
+                # If the AI returns nothing, force a failure to trigger Mistral
+                if not res_text:
+                    raise ValueError("OpenRouter API succeeded, but the model returned an empty string.")
+                    
+                return res_text
+            except Exception as e_or:
+                print(f"⚠️ OpenRouter failed: {e_or}. Activating Local Mistral...")
 
-    try:
-        print("🤖 Querying Local Mistral Node via Ollama standard pipeline...")
-        with httpx.Client(timeout=300.0) as client:
-            ollama_response = client.post(
-                "http://127.0.0.1:11434/api/generate",
-                json={
-                    "model": "mistral",
-                    "prompt": raw_prompt_string,
-                    "stream": False
-                }
-            )
-            if ollama_response.status_code == 200:
-                return ollama_response.json().get("response", "Local Mistral failed to generate content.")
-    except Exception as e_ollama:
-        print(f"🚨 Critical Failure: Local Ollama instance unreachable. Details: {e_ollama}")
+        # Fallback directly to Local Mistral. NO Gemini used here to save API limits!
+        try:
+            print("🤖 Querying Local Mistral Node via Ollama...")
+            with httpx.Client(timeout=300.0) as client:
+                ollama_response = client.post(
+                    "http://127.0.0.1:11434/api/generate",
+                    json={
+                        "model": "mistral",
+                        "prompt": raw_prompt_string,
+                        "stream": False
+                    }
+                )
+                if ollama_response.status_code == 200:
+                    return ollama_response.json().get("response", "Local Mistral failed to generate content.")
+        except Exception as e_ollama:
+            print(f"🚨 Critical Failure: Local Ollama instance unreachable. Details: {e_ollama}")
+            
+        return "Interviewer service temporarily degraded. Please submit your answer again."
+
+    # --- TASK: EVALUATION (Strictly Gemini 3.5 + Local) ---
+    if task_type == "eval":
+        try:
+            print(f"🧠 Querying {gemini_model} API for Evaluation...")
+            llm = ChatGoogleGenerativeAI(model=gemini_model, google_api_key=PRIMARY_KEY)
+            response = llm.invoke(messages)
+            return extract_text(response.content)
+        except Exception as e_primary:
+            print(f"⚠️ Primary Gemini failed: {e_primary}. Transitioning to Backup Key...")
+            try:
+                if BACKUP_KEY:
+                    llm_backup = ChatGoogleGenerativeAI(model=gemini_model, google_api_key=BACKUP_KEY)
+                    backup_response = llm_backup.invoke(messages)
+                    return extract_text(backup_response.content)
+            except Exception as e_backup:
+                print(f"⚠️ Backup Gemini failed: {e_backup}. Activating Local Mistral...")
+
+        # Fallback to local Mistral for Evaluation
+        try:
+            print("🤖 Querying Local Mistral Node via Ollama for Evaluation...")
+            with httpx.Client(timeout=300.0) as client:
+                ollama_response = client.post(
+                    "http://127.0.0.1:11434/api/generate",
+                    json={
+                        "model": "mistral",
+                        "prompt": raw_prompt_string,
+                        "stream": False
+                    }
+                )
+                if ollama_response.status_code == 200:
+                    return ollama_response.json().get("response", "Local Mistral failed to generate content.")
+        except Exception as e_ollama:
+            print(f"🚨 Critical Failure: Local Ollama instance unreachable. Details: {e_ollama}")
+            
+        return "{}"
         
     return "Interviewer service temporarily degraded. Please submit your answer again."
 
@@ -256,7 +306,7 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
         docs = []
 
     if not docs:
-        print(f"⚠️ Custom Role detected: '{role}'. Routing to global textbook search.")
+        print(f"🔎 Broadening RAG search to global knowledge base for '{role}'...")
         docs = vector_db.similarity_search(search_query, k=1)
         
     rag_context = docs[0].page_content if docs else "General software engineering and machine learning principles."
@@ -274,7 +324,7 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
         CRITICAL OUTPUT GUARDRAIL:
         Output ONLY the verbal text spoken out loud to the candidate. Do not write any thoughts, explanations, metadata, or wrappers like 'Question:'."""
     )
-    first_question = generate_ai_response([prompt])
+    first_question = generate_ai_response([prompt], task_type="chat")
 
     conn = sqlite3.connect("synapsift.db")
     cursor = conn.cursor()
@@ -320,21 +370,23 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
         
     rag_context = docs[0].page_content if docs else "Core computer systems engineering."
 
-    # --- AGGRESSIVE MISTRAL PROMPT ---
+    # --- DYNAMIC CONVERSATIONAL INTERVIEWER PROMPT ---
     prompt = HumanMessage(
-        content=f"""You are a strict, fast-paced technical interviewer.
+        content=f"""You are a live human technical interviewer.
         Candidate just said: "{payload.message}"
-        Next topic to test: {rag_context}
+        Next topic context to test: {rag_context}
         
         INSTRUCTIONS:
-        1. Ask exactly ONE short, direct question about the next topic.
-        2. NEVER use introductory filler (e.g. do not say "Let's move on", "Let me rephrase", or "Given your response").
-        3. NEVER mention textbooks or sections.
-        4. NEVER repeat a question you have already asked. If the candidate says "what?" or "I don't know", move on to a completely NEW technical concept.
-        5. If the candidate clearly has zero technical knowledge after multiple tries, output ONLY the word: [TERMINATE]
+        1. React NATURALLY to the candidate's input. 
+           - If they give a 1-word or dismissive answer like "ok", "uhh", or "sure", DO NOT just move on. Politely ask them to elaborate or clarify. 
+           - BANNED FILLER: Never say "Got it", "Exactly", or "Great" if they didn't actually answer the previous question.
+        2. THE BLIND RULE: The candidate CANNOT see the textbook context. NEVER refer to "this list", "this table", "this image", or "the text". You must translate the textbook concepts into self-contained, verbal questions.
+        3. Formulate ONE distinct technical question based on the topic.
+        4. If the candidate gives up entirely or speaks nonsense multiple times across the interview, output ONLY: [TERMINATE]
         """
     )
-    next_question = generate_ai_response([prompt])
+
+    next_question = generate_ai_response([prompt], task_type="chat")
 
     is_completed = False
     if "[TERMINATE]" in next_question:
@@ -385,16 +437,18 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
             qa_pairs.append({"question": current_question, "answer": text})
             current_question = None
 
+    # --- COMPLETE TRANSCRIPT EVALUATION ---
     verification_payload = json.dumps(qa_pairs, indent=2)
     
     prompt = HumanMessage(
-        content=f"""Analyze this technical interview transcript:
+        content=f"""Analyze this COMPLETE technical interview transcript:
         {verification_payload}
         
         Evaluate the candidate and output ONLY a valid JSON object matching this exact structure. 
         CRITICAL RULES:
-        1. Only include a MAXIMUM OF 4 items in the "breakdown" array.
-        2. RUTHLESS SCORING: If the candidate answers "I don't know", "no", gives gibberish, or uses slang, the score MUST BE EXACTLY 0.
+        1. You must evaluate EVERY question. Output EXACTLY {len(qa_pairs)} items in the "breakdown" array. Do not skip any.
+        2. RUTHLESS SCORING: If the candidate answers "I don't know", "no", "uhh", gives gibberish, or uses slang, the score for that question MUST BE EXACTLY 0.
+        3. The "overallScore" must be the true mathematical average of all {len(qa_pairs)} individual question scores.
         
         {{
             "overallScore": 85,
@@ -410,7 +464,7 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
             ]
         }}"""
     )
-    response_text = generate_ai_response([prompt])
+    response_text = generate_ai_response([prompt], task_type="eval")
     
     try:
         match = re.search(r'\{.*\}', response_text, re.DOTALL)
@@ -428,9 +482,17 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
             "insights": "Please review logs manually.",
             "breakdown": []
         }
-        json_str = json.dumps(parsed_json)
 
-    # --- ADMIN CACHE FIX: ALWAYS save the JSON string to the DB, even if it failed ---
+    # === 🛡️ BACKEND STRUCTURAL INTEGRITY OVERRIDE LOOP ===
+    if "breakdown" in parsed_json and isinstance(parsed_json["breakdown"], list):
+        # We ONLY override the text of the questions the AI actually evaluated. 
+        # No unfair padding with 0s!
+        for i in range(min(len(parsed_json["breakdown"]), len(qa_pairs))):
+            parsed_json["breakdown"][i]["question"] = qa_pairs[i]["question"]
+            parsed_json["breakdown"][i]["answer"] = qa_pairs[i]["answer"]
+
+    json_str = json.dumps(parsed_json)
+
     cursor.execute("UPDATE interviews SET overall_score = ?, evaluation_summary = ?, evaluation_data = ?, status = 'COMPLETED' WHERE id = ?", 
                   (parsed_json.get("overallScore", 0), parsed_json.get("summary", ""), json_str, interview_id))
     conn.commit()
