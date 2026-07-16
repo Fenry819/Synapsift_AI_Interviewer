@@ -9,6 +9,7 @@ import httpx
 import bcrypt
 import re
 from io import BytesIO
+from better_profanity import profanity
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
@@ -127,15 +128,15 @@ def generate_ai_response(messages: list, task_type: str = "chat") -> str:
             print("🤖 Querying Local Mistral Node via Ollama...")
             with httpx.Client(timeout=300.0) as client:
                 ollama_response = client.post(
-                    "http://127.0.0.1:11434/api/generate",
+                    "http://127.0.0.1:11434/api/chat",
                     json={
                         "model": "mistral",
-                        "prompt": raw_prompt_string,
+                        "messages": [{"role": "user", "content": raw_prompt_string}],
                         "stream": False
                     }
                 )
                 if ollama_response.status_code == 200:
-                    return ollama_response.json().get("response", "Local Mistral failed to generate content.")
+                    return ollama_response.json().get("message", {}).get("content", "Local Mistral failed to generate content.")
         except Exception as e_ollama:
             print(f"🚨 Critical Failure: Local Ollama instance unreachable. Details: {e_ollama}")
             
@@ -163,15 +164,15 @@ def generate_ai_response(messages: list, task_type: str = "chat") -> str:
             print("🤖 Querying Local Mistral Node via Ollama for Evaluation...")
             with httpx.Client(timeout=300.0) as client:
                 ollama_response = client.post(
-                    "http://127.0.0.1:11434/api/generate",
+                    "http://127.0.0.1:11434/api/chat",
                     json={
                         "model": "mistral",
-                        "prompt": raw_prompt_string,
+                        "messages": [{"role": "user", "content": raw_prompt_string}],
                         "stream": False
                     }
                 )
                 if ollama_response.status_code == 200:
-                    return ollama_response.json().get("response", "Local Mistral failed to generate content.")
+                    return ollama_response.json().get("message", {}).get("content", "Local Mistral failed to generate content.")
         except Exception as e_ollama:
             print(f"🚨 Critical Failure: Local Ollama instance unreachable. Details: {e_ollama}")
             
@@ -370,25 +371,33 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
         
     rag_context = docs[0].page_content if docs else "Core computer systems engineering."
 
-    # --- DYNAMIC CONVERSATIONAL INTERVIEWER PROMPT ---
-    prompt = HumanMessage(
-        content=f"""You are a live human technical interviewer conducting a screening. You MUST stay in character.
-        Candidate just said: "{payload.message}"
-        Next topic context to test: {rag_context}
-        
-        STRICT INSTRUCTIONS:
-        1. FIRST-PERSON ONLY: Speak directly to the candidate as "I" and "you". NEVER refer to "the candidate" in the third person. NEVER output internal thoughts, bullet points, or numbered lists.
-        2. HANDLING HOSTILITY: If the candidate uses profanity, slurs, or insults, warn them coldly and professionally (e.g., "Let's keep this professional.") and immediately ask your next technical question. Do NOT give a moral lecture.
-        3. REACT NATURALLY: 
-           - If they give a dismissive answer like "ok", "uhh", or "sure", politely ask them to elaborate. 
-           - BANNED FILLER: Never say "Got it", "Exactly", or "Great" if they didn't actually answer.
-        4. THE BLIND RULE: The candidate CANNOT see the textbook context. NEVER refer to "this list", "this table", or "the text". 
-        5. Ask exactly ONE distinct technical question based on the topic. Keep your response conversational and under 4 sentences.
-        6. If the candidate is repeatedly abusive, speaks nonsense multiple times, or gives up entirely, output ONLY the exact word: [TERMINATE]
-        """
-    )
+    # === 🛡️ PRODUCTION GATEWAY HOSTILITY TRAP ===
+    # 1. Check for thousands of profanities and leetspeak bypasses instantly
+    is_profane = profanity.contains_profanity(payload.message)
+    
+    # 2. Check for explicit interview resignation (non-swear words)
+    resignation_keywords = ["give up", "i won't", "refuse", "stop asking"]
+    is_resigning = any(word in payload.message.lower() for word in resignation_keywords)
 
-    next_question = generate_ai_response([prompt], task_type="chat")
+    if is_profane or is_resigning:
+        next_question = "[TERMINATE]"
+    else:
+        # --- HYBRID INTERVIEWER PROMPT (Strict + Conversational) ---
+        prompt = HumanMessage(
+            content=f"""You are a strict, busy Senior Staff Engineer conducting a technical interview. YOU ARE NOT AN AI ASSISTANT. 
+            Candidate just said: "{payload.message}"
+            Next technical topic to test: {rag_context}
+            
+            CRITICAL DIRECTIVES:
+            1. FIRST-PERSON ONLY: Speak directly to the candidate using "I" and "you". NEVER refer to "the candidate" in the third person. NEVER output bullet points, numbered lists, or internal thoughts.
+            2. THE TERMINATION PROTOCOL: If the candidate explicitly refuses to answer or says they give up, you MUST output this exact string and absolutely nothing else: [TERMINATE]
+            3. NO CUSTOMER SERVICE VOICE: NEVER say "I understand", "Let's move forward", or give moral lectures. You are a blunt human engineer, not a polite chatbot.
+            4. REACT NATURALLY TO DODGING: If they give a dismissive answer like "ok", "uhh", or "sure", do not just move on. Politely but firmly ask them to elaborate on the actual concept. BANNED FILLER: Never say "Got it" or "Great" if they didn't actually answer.
+            5. BLIND RULE: The candidate CANNOT see the textbook context. NEVER refer to "this list", "this table", or "the text". 
+            6. Ask exactly ONE distinct technical question based on the topic. Keep your response conversational and under 4 sentences.
+            """
+        )
+        next_question = generate_ai_response([prompt], task_type="chat")
 
     is_completed = False
     if "[TERMINATE]" in next_question:
