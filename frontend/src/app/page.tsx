@@ -1,7 +1,7 @@
 "use client";
 
-import React, { useState, useEffect } from 'react';
-import { Upload, Briefcase, Play, Send, CheckCircle, AlertCircle, RefreshCw, Network, Lock, User, LogOut, Users, FileText, Trash2, UserX } from 'lucide-react';
+import React, { useState, useEffect, useRef } from 'react';
+import { Upload, Briefcase, Play, Send, CheckCircle, AlertCircle, RefreshCw, Network, Lock, User, LogOut, Users, FileText, Trash2, UserX, FileBadge } from 'lucide-react';
 
 type Step = 'AUTH' | 'SETUP' | 'INTERVIEW' | 'SUMMARY' | 'ADMIN';
 
@@ -29,6 +29,7 @@ interface CandidateRecord {
 }
 
 export default function SynapSiftScreener() {
+  const [isInterviewComplete, setIsInterviewComplete] = useState<boolean>(false);
   const [currentStep, setCurrentStep] = useState<Step>('AUTH');
   const [isLogin, setIsLogin] = useState<boolean>(true);
   const [authName, setAuthName] = useState<string>('');
@@ -49,11 +50,14 @@ export default function SynapSiftScreener() {
   const [isEvaluating, setIsEvaluating] = useState<boolean>(false);
   const [interviewId, setInterviewId] = useState<string | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  const [showResume, setShowResume] = useState<boolean>(false);
 
   const [candidates, setCandidates] = useState<CandidateRecord[]>([]);
-  const [analysisReport, setAnalysisReport] = useState<{ overallScore: number; summary: string; insights: string; breakdown: QAAnalysis[]; }>({
+  const [analysisReport, setAnalysisReport] = useState<{ overallScore: number; summary: string; insights: string; resume_url?: string; breakdown: QAAnalysis[]; }>({
     overallScore: 0, summary: "", insights: "", breakdown: []
   });
+
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
 
   useEffect(() => {
     const token = localStorage.getItem("synapsift_token");
@@ -72,6 +76,12 @@ export default function SynapSiftScreener() {
       }
     }
   }, []);
+
+  const handleInputResize = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
+    setInputAnswer(e.target.value);
+    e.target.style.height = 'auto';
+    e.target.style.height = `${e.target.scrollHeight}px`;
+  };
 
   const handleLogOut = () => {
     localStorage.clear();
@@ -179,6 +189,7 @@ export default function SynapSiftScreener() {
   };
 
   const startSession = async () => {
+    setIsInterviewComplete(false);
     if (!uploadedFile || !userToken) return alert("Please upload a resume file.");
     if (selectedRole === 'Custom Role' && !customRole.trim()) return alert("Please enter a custom role.");
     
@@ -213,6 +224,11 @@ export default function SynapSiftScreener() {
     const candidateMsg: Message = { id: Date.now().toString(), sender: 'candidate', text: inputAnswer, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) };
     setMessages((prev) => [...prev, candidateMsg]);
     setInputAnswer('');
+    
+    if (textareaRef.current) {
+      textareaRef.current.style.height = '44px'; // Reset height
+    }
+    
     setIsAiThinking(true);
 
     try {
@@ -223,10 +239,12 @@ export default function SynapSiftScreener() {
       });
       const data = await response.json();
       
+      // Add the AI's message to the chat
       setMessages((prev) => [...prev, { id: (Date.now() + 1).toString(), sender: 'ai', text: data.reply, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
 
+      // Check the exact status from the backend to reveal the submit button!
       if (data.status === 'COMPLETED') {
-        setTimeout(() => handleTerminate(), 1500);
+        setIsInterviewComplete(true); 
       }
     } catch (error) {
       console.error(error);
@@ -388,7 +406,7 @@ export default function SynapSiftScreener() {
           <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8 max-w-xl w-full mx-auto shadow-2xl space-y-6">
             <div className="space-y-2">
               <h2 className="text-2xl font-bold tracking-tight text-white">Initialize Assessment</h2>
-              <p className="text-sm text-slate-400">Upload your resume to calibrate our dynamic evaluation engine.</p>
+              <p className="text-sm text-slate-400">Upload your latest resume to calibrate our dynamic evaluation engine.</p>
             </div>
             
             <div className="space-y-2">
@@ -420,22 +438,21 @@ export default function SynapSiftScreener() {
         )}
 
         {currentStep === 'INTERVIEW' && (
-          <div className="bg-slate-900 border border-slate-800 rounded-2xl flex flex-col h-[75vh] shadow-2xl overflow-hidden">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl flex flex-col h-[80vh] shadow-2xl overflow-hidden">
             <div className="px-6 py-4 border-b border-slate-800 bg-slate-900/80 flex items-center justify-between">
               <div>
                 <h3 className="font-semibold text-sm text-white">Active Stream Evaluation</h3>
                 <p className="text-xs text-slate-400 truncate">Target: {selectedRole === 'Custom Role' ? customRole : selectedRole} | Matrix ID: <span className="font-mono">{interviewId || "Initializing..."}</span></p>
               </div>
-              <div className="flex gap-3">
-                <button onClick={handleAbortSession} className="text-xs bg-slate-950 text-slate-400 border border-slate-800 px-3 py-1.5 rounded-lg hover:bg-red-950 hover:text-red-400 transition">
-                  Abort Session
-                </button>
-              </div>
+              <button onClick={handleAbortSession} className="text-xs bg-slate-950 text-slate-400 border border-slate-800 px-3 py-1.5 rounded-lg hover:bg-red-950 hover:text-red-400 transition">
+                Abort Session
+              </button>
             </div>
-            <div className="flex-1 overflow-y-auto p-6 space-y-4 bg-slate-950/30">
+            
+            <div className="flex-1 overflow-y-auto p-6 space-y-6 bg-slate-950/30">
               {messages.map((msg) => (
                 <div key={msg.id} className={`flex flex-col ${msg.sender === 'ai' ? 'items-start' : 'items-end'}`}>
-                  <div className={`max-w-[75%] rounded-2xl px-4 py-3 text-sm shadow-md leading-relaxed whitespace-pre-wrap ${msg.sender === 'ai' ? 'bg-slate-900 border border-slate-800 text-slate-100 rounded-tl-none' : 'bg-indigo-600 text-white rounded-tr-none'}`}>
+                  <div className={`max-w-[85%] rounded-2xl px-5 py-4 shadow-md whitespace-pre-wrap ${msg.sender === 'ai' ? 'bg-slate-900 border border-slate-800 text-slate-100 rounded-tl-none text-[15px] leading-relaxed font-normal tracking-wide' : 'bg-indigo-600 text-white rounded-tr-none text-[14px] leading-relaxed'}`}>
                     {msg.text}
                   </div>
                 </div>
@@ -446,22 +463,42 @@ export default function SynapSiftScreener() {
                 </div>
               )}
             </div>
+            
             <div className="p-4 border-t border-slate-800 bg-slate-900">
-              <div className="flex items-center gap-3 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2 focus-within:border-indigo-500 transition">
-                <textarea 
-                  placeholder="Formulate your technical response..." 
-                  value={inputAnswer} 
-                  onChange={(e) => setInputAnswer(e.target.value)} 
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' && !e.shiftKey) {
-                      e.preventDefault();
-                      handleSendAnswer();
-                    }
-                  }} 
-                  className="flex-1 bg-transparent border-none text-sm text-slate-200 focus:outline-none py-2 resize-none min-h-[44px] max-h-32 overflow-y-auto" 
-                  rows={1}
-                />
-                <button onClick={handleSendAnswer} className="p-2 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition"><Send size={14} /></button>
+              <div className="flex flex-col gap-3">
+                
+                {!isInterviewComplete ? (
+                  <>
+                    <div className="flex items-end gap-3 bg-slate-950 border border-slate-800 rounded-xl px-4 py-2 focus-within:border-indigo-500 transition">
+                      <textarea 
+                        ref={textareaRef}
+                        placeholder="Formulate your technical response..." 
+                        value={inputAnswer} 
+                        onChange={handleInputResize}
+                        onKeyDown={(e) => {
+                          if (e.key === 'Enter' && !e.shiftKey) {
+                            e.preventDefault();
+                            handleSendAnswer();
+                          }
+                        }} 
+                        className="flex-1 bg-transparent border-none text-sm text-slate-200 focus:outline-none py-2 resize-none min-h-[40px] max-h-32 overflow-y-auto custom-scrollbar" 
+                        rows={1}
+                      />
+                      <button onClick={handleSendAnswer} className="p-2 mb-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition"><Send size={14} /></button>
+                    </div>
+                    <div className="flex justify-between items-center px-1">
+                      <span className="text-[11px] text-slate-500">Press <strong className="text-slate-400">Enter</strong> to send, <strong className="text-slate-400">Shift + Enter</strong> for new line.</span>
+                    </div>
+                  </>
+                ) : (
+                  <div className="flex flex-col items-center justify-center p-4 bg-slate-950 border border-slate-800 rounded-xl gap-3">
+                    <p className="text-sm text-slate-400">The technical assessment has been concluded.</p>
+                    <button onClick={() => handleTerminate()} className="text-sm font-medium bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-500/20 px-6 py-2.5 rounded-lg transition flex items-center gap-2">
+                      <CheckCircle size={16} /> End Interview & Get Result
+                    </button>
+                  </div>
+                )}
+                
               </div>
             </div>
           </div>
@@ -490,18 +527,39 @@ export default function SynapSiftScreener() {
                 )}
               </div>
             </div>
+
+            {/* Update your analysisReport state interface to expect resume_url instead of resume */}
+            {!isEvaluating && userRole === 'admin' && analysisReport.resume_url && (
+               <div className="bg-slate-900 border border-slate-800 rounded-xl p-5">
+                  <button onClick={() => setShowResume(!showResume)} className="flex items-center justify-between w-full text-left">
+                    <span className="text-sm font-semibold text-indigo-300 flex items-center gap-2"><FileBadge size={16} /> Candidate Resume (Original PDF)</span>
+                    <span className="text-xs text-slate-500">{showResume ? 'Hide' : 'View'}</span>
+                  </button>
+                  {showResume && (
+                    <div className="mt-4 rounded-lg overflow-hidden border border-slate-800 h-[600px]">
+                      <iframe 
+                        src={`${analysisReport.resume_url}#toolbar=0`} 
+                        width="100%" 
+                        height="100%" 
+                        title="Candidate Resume" 
+                        className="border-none bg-slate-950" 
+                      />
+                    </div>
+                  )}
+               </div>
+            )}
             
             {!isEvaluating && analysisReport.breakdown.length > 0 && (
               <div className="space-y-4">
-                <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">Traceable Topic Log</h3>
+                <h3 className="text-xs font-semibold uppercase tracking-wider text-slate-400">Traceable Topic Log (Top Questions)</h3>
                 {analysisReport.breakdown.map((item, i) => (
                   <div key={i} className="bg-slate-900 border border-slate-800 rounded-xl p-5 space-y-3">
                     <div className="flex items-start justify-between gap-4">
-                      <p className="text-sm font-medium text-slate-200">Q{i+1}: {item.question}</p>
-                      <span className={`text-xs font-medium px-2 py-1 rounded-md ${item.score > 75 ? 'bg-emerald-500/10 text-emerald-400' : item.score > 50 ? 'bg-yellow-500/10 text-yellow-400' : 'bg-red-500/10 text-red-400'}`}>Score: {item.score}%</span>
+                      <p className="text-sm font-medium text-slate-200">Q: {item.question}</p>
+                      <span className={`text-xs font-medium px-2 py-1 rounded-md shrink-0 ${item.score > 75 ? 'bg-emerald-500/10 text-emerald-400' : item.score > 50 ? 'bg-yellow-500/10 text-yellow-400' : 'bg-red-500/10 text-red-400'}`}>Score: {item.score}%</span>
                     </div>
-                    <p className="text-sm text-slate-400 italic">"{item.answer || "[No response provided in transcript]"}"</p>
-                    <div className="bg-slate-800/50 rounded-lg p-3 text-xs text-slate-300 flex items-start gap-2 border border-slate-700/50">
+                    <p className="text-[13px] text-slate-400 italic bg-slate-950 p-3 rounded-lg border border-slate-800/50">"{item.answer || "[No response provided]"}"</p>
+                    <div className="bg-slate-800/30 rounded-lg p-3 text-xs text-slate-300 flex items-start gap-2 border border-slate-700/30">
                       <AlertCircle size={14} className="mt-0.5 text-indigo-400 shrink-0" />
                       <p>{item.feedback}</p>
                     </div>
@@ -511,7 +569,7 @@ export default function SynapSiftScreener() {
             )}
 
             {!isEvaluating && (
-              <div className="flex justify-end gap-3">
+              <div className="flex justify-end gap-3 pb-8">
                 {userRole === 'admin' ? (
                    <button onClick={() => setCurrentStep('ADMIN')} className="flex items-center gap-2 text-xs bg-indigo-600 text-white px-4 py-2 rounded-xl hover:bg-indigo-500 transition">Back to Dashboard</button>
                 ) : (

@@ -11,6 +11,7 @@ import re
 from io import BytesIO
 from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Depends, Header
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
@@ -65,6 +66,20 @@ def init_relational_db():
             FOREIGN KEY(interview_id) REFERENCES interviews(id)
         )
     """)
+
+    try:
+        cursor.execute("ALTER TABLE interviews ADD COLUMN resume_text TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE interviews ADD COLUMN evaluation_data TEXT")
+    except sqlite3.OperationalError:
+        pass
+    try:
+        cursor.execute("ALTER TABLE interviews ADD COLUMN resume_url TEXT")
+    except sqlite3.OperationalError:
+        pass
+
     conn.commit()
     conn.close()
 
@@ -115,7 +130,12 @@ def generate_ai_response(messages: list) -> str:
     return "Interviewer service temporarily degraded. Please submit your answer again."
 
 # 4. RAG Ingestion Pipeline: Qdrant Setup
-embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+# Enforce offline mode to bypass Hugging Face network checks
+os.environ["HF_HUB_OFFLINE"] = "1"
+embeddings = HuggingFaceEmbeddings(
+    model_name="all-MiniLM-L6-v2",
+    model_kwargs={'local_files_only': True}
+)
 
 def initialize_vector_db():
     local_qdrant_path = "./qdrant_db"
@@ -134,6 +154,9 @@ vector_db = initialize_vector_db()
 # 5. API Setup & Authentication Guardrails
 app = FastAPI(title="SynapSift AI Advanced Backend")
 
+os.makedirs("uploads", exist_ok=True)
+app.mount("/uploads", StaticFiles(directory="uploads"), name="uploads")
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["http://localhost:3000", "http://127.0.0.1:3000"],
@@ -147,7 +170,7 @@ class SignUpRequest(BaseModel):
     email: EmailStr
     password: str
     role: str
-    admin_code: str | None = None  # Add this new field
+    admin_code: str | None = None  
 
 class LoginRequest(BaseModel):
     email: EmailStr
@@ -216,19 +239,22 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
     interview_id = "interview_" + os.urandom(4).hex()
     
     pdf_bytes = await resume.read()
+    
+    file_path = f"uploads/{interview_id}.pdf"
+    with open(file_path, "wb") as f:
+        f.write(pdf_bytes)
+    resume_url = f"http://127.0.0.1:8000/{file_path}"
+
     reader = PyPDF2.PdfReader(BytesIO(pdf_bytes))
-    resume_text = "".join([page.extract_text() + "\n" for page in reader.pages])[:1500] 
+    resume_text = "".join([page.extract_text() + "\n" for page in reader.pages])[:1500]
 
     search_query = f"Target Role: {role}. Candidate Background: {resume_text[:300]}"
     
-    # 🌟 MULTI-TIER RAG FALLBACK SYSTEM 🌟
     try:
-        # Tier 1: Try strict metadata match for the requested role
         docs = vector_db.similarity_search(search_query, k=1, filter={"target_role": role})
     except Exception:
         docs = []
 
-    # Tier 2 & 3: Fallback to general search if the role doesn't exist in metadata
     if not docs:
         print(f"⚠️ Custom Role detected: '{role}'. Routing to global textbook search.")
         docs = vector_db.similarity_search(search_query, k=1)
@@ -252,8 +278,8 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
 
     conn = sqlite3.connect("synapsift.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO interviews (id, user_id, target_role, status) VALUES (?, ?, ?, 'ONGOING')", 
-                  (interview_id, user_meta["user_id"], role))
+    cursor.execute("INSERT INTO interviews (id, user_id, target_role, resume_text, resume_url, status) VALUES (?, ?, ?, ?, ?, 'ONGOING')", 
+                  (interview_id, user_meta["user_id"], role, resume_text, resume_url))
     cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk) VALUES (?, 'ai', ?, ?)", 
                   (interview_id, first_question, rag_context))
     conn.commit()
@@ -273,8 +299,8 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
                   (payload.interview_id, payload.message))
     conn.commit()
 
-    if turns_taken >= 15:
-        closing_msg = "Thank you for your extensive responses. The session is now concluded."
+    if turns_taken >= 10:
+        closing_msg = "Thank you so much for your time today. We've covered a lot of ground, and I have all the information I need. I wish you the best of luck, and you can proceed to generate your evaluation results now!"
         cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk) VALUES (?, 'ai', ?, ?)", 
                       (payload.interview_id, closing_msg, "System Hard Stop"))
         cursor.execute("UPDATE interviews SET status = 'COMPLETED' WHERE id = ?", (payload.interview_id,))
@@ -294,30 +320,25 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
         
     rag_context = docs[0].page_content if docs else "Core computer systems engineering."
 
-    # --- MISTRAL-PROOF PROMPT ---
+    # --- AGGRESSIVE MISTRAL PROMPT ---
     prompt = HumanMessage(
-        content=f"""You are a cold, strict interviewer for a {payload.role} role.
-        Candidate's last answer: "{payload.message}"
-        Next question context: {rag_context}
+        content=f"""You are a strict, fast-paced technical interviewer.
+        Candidate just said: "{payload.message}"
+        Next topic to test: {rag_context}
         
-        RULES (FOLLOW EXACTLY):
-        1. DO NOT evaluate the candidate out loud. NEVER say "The candidate has provided..." or "Good answer."
-        2. DO NOT mention the "Textbook" or "Context".
-        3. Simply output the VERY NEXT technical question you want to ask.
-        4. If the candidate says "I don't know", give a 1-sentence answer, then ask a new question.
-        
-        TERMINATION:
-        If the candidate proves they have NO knowledge across multiple questions, OR if they have answered perfectly and you are satisfied, YOU MUST END THE INTERVIEW. 
-        To end it, do NOT ask a question. Output ONLY this exact string: "[TERMINATE]"
-        
-        OUTPUT EXACTLY WHAT YOU WILL SPEAK. NO OTHER TEXT."""
+        INSTRUCTIONS:
+        1. Ask exactly ONE short, direct question about the next topic.
+        2. NEVER use introductory filler (e.g. do not say "Let's move on", "Let me rephrase", or "Given your response").
+        3. NEVER mention textbooks or sections.
+        4. NEVER repeat a question you have already asked. If the candidate says "what?" or "I don't know", move on to a completely NEW technical concept.
+        5. If the candidate clearly has zero technical knowledge after multiple tries, output ONLY the word: [TERMINATE]
+        """
     )
     next_question = generate_ai_response([prompt])
 
     is_completed = False
-    if "[TERMINATE]" in next_question or turns_taken >= 10:
-        # Strip out any ghost questions Mistral tried to sneak in
-        next_question = "Thank you for your responses today. We have gathered sufficient data to conclude this technical screening.\n\n*(Session gracefully terminated by AI based on candidate assessment. Compiling analytics...)*"
+    if "[TERMINATE]" in next_question:
+        next_question = "Thank you for your responses today. We have gathered sufficient data to conclude this technical screening. Best of luck, and please proceed to your evaluation!"
         is_completed = True
 
     cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk) VALUES (?, 'ai', ?, ?)", 
@@ -335,11 +356,23 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
 async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get_current_user)):
     conn = sqlite3.connect("synapsift.db")
     cursor = conn.cursor()
+    
+    # 1. CHECK CACHE FIRST
+    cursor.execute("SELECT evaluation_data, resume_url FROM interviews WHERE id = ?", (interview_id,))
+    row = cursor.fetchone()
+    
+    if row and row[0]: 
+        parsed_json = json.loads(row[0])
+        parsed_json["resume_url"] = row[1]
+        conn.close()
+        return parsed_json
+        
+    # 2. GENERATE WITH GEMINI
     cursor.execute("SELECT sender, text_content FROM messages WHERE interview_id = ? ORDER BY id ASC", (interview_id,))
     rows = cursor.fetchall()
-    conn.close()
     
     if not rows:
+        conn.close()
         raise HTTPException(status_code=404, detail="Requested screening logs could not be located")
         
     qa_pairs = []
@@ -351,18 +384,17 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
         elif sender == 'candidate' and current_question:
             qa_pairs.append({"question": current_question, "answer": text})
             current_question = None
-            
-    if current_question:
-        qa_pairs.append({"question": current_question, "answer": "[No response provided]"})
 
     verification_payload = json.dumps(qa_pairs, indent=2)
     
-    # --- MISTRAL-PROOF JSON PROMPT ---
     prompt = HumanMessage(
         content=f"""Analyze this technical interview transcript:
         {verification_payload}
         
-        Evaluate the candidate and output ONLY a valid JSON object matching this exact structure. NO markdown formatting. NO conversational text.
+        Evaluate the candidate and output ONLY a valid JSON object matching this exact structure. 
+        CRITICAL RULES:
+        1. Only include a MAXIMUM OF 4 items in the "breakdown" array.
+        2. RUTHLESS SCORING: If the candidate answers "I don't know", "no", gives gibberish, or uses slang, the score MUST BE EXACTLY 0.
         
         {{
             "overallScore": 85,
@@ -372,42 +404,40 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
                 {{
                     "question": "The question asked",
                     "answer": "The candidate's answer",
-                    "score": 90,
-                    "feedback": "1 sentence feedback."
+                    "score": 0,
+                    "feedback": "1 sentence strict feedback explaining the score."
                 }}
             ]
         }}"""
     )
     response_text = generate_ai_response([prompt])
     
-    # --- BULLETPROOF REGEX JSON EXTRACTOR ---
     try:
-        # Find everything between the first { and the last }
         match = re.search(r'\{.*\}', response_text, re.DOTALL)
         if match:
             json_str = match.group(0)
             parsed_json = json.loads(json_str)
-            
-            # Update the relational DB with the final score
-            conn = sqlite3.connect("synapsift.db")
-            cursor = conn.cursor()
-            cursor.execute("UPDATE interviews SET overall_score = ?, evaluation_summary = ? WHERE id = ?", 
-                          (parsed_json.get("overallScore", 0), parsed_json.get("summary", ""), interview_id))
-            conn.commit()
-            conn.close()
-            
-            return parsed_json
         else:
             raise ValueError("No JSON boundaries found.")
             
     except Exception as e:
         print(f"JSON Parsing Failed: {e}. Raw Response: {response_text}")
-        return {
-            "overallScore": 50, 
-            "summary": "AI Evaluation encountered formatting restrictions due to local model limits. Raw data preserved.",
-            "insights": "Candidate completed all questions, but LLM analytics engine failed to parse insights.",
-            "breakdown": [{"question": p["question"], "answer": p["answer"], "score": 50, "feedback": "Logs saved for manual review."} for p in qa_pairs]
+        parsed_json = {
+            "overallScore": 0, 
+            "summary": "Evaluation failed to parse.",
+            "insights": "Please review logs manually.",
+            "breakdown": []
         }
+        json_str = json.dumps(parsed_json)
+
+    # --- ADMIN CACHE FIX: ALWAYS save the JSON string to the DB, even if it failed ---
+    cursor.execute("UPDATE interviews SET overall_score = ?, evaluation_summary = ?, evaluation_data = ?, status = 'COMPLETED' WHERE id = ?", 
+                  (parsed_json.get("overallScore", 0), parsed_json.get("summary", ""), json_str, interview_id))
+    conn.commit()
+    
+    parsed_json["resume_url"] = row[1] if row else None
+    conn.close()
+    return parsed_json
 
 @app.get("/api/admin/candidates")
 async def get_all_candidates(user_meta: dict = Depends(get_current_user)):
@@ -436,7 +466,6 @@ async def delete_account(user_meta: dict = Depends(get_current_user)):
     cursor = conn.cursor()
     user_id = user_meta["user_id"]
     
-    # Cascade delete: Messages -> Interviews -> User
     cursor.execute("DELETE FROM messages WHERE interview_id IN (SELECT id FROM interviews WHERE user_id = ?)", (user_id,))
     cursor.execute("DELETE FROM interviews WHERE user_id = ?", (user_id,))
     cursor.execute("DELETE FROM users WHERE id = ?", (user_id,))
@@ -453,7 +482,6 @@ async def delete_interview(interview_id: str, user_meta: dict = Depends(get_curr
     conn = sqlite3.connect("synapsift.db")
     cursor = conn.cursor()
     
-    # Admin rejecting/deleting a candidate's record
     cursor.execute("DELETE FROM messages WHERE interview_id = ?", (interview_id,))
     cursor.execute("DELETE FROM interviews WHERE id = ?", (interview_id,))
     
@@ -466,7 +494,6 @@ async def abort_interview(interview_id: str, user_meta: dict = Depends(get_curre
     conn = sqlite3.connect("synapsift.db")
     cursor = conn.cursor()
     
-    # Security: Ensure the candidate actually owns the interview they are aborting
     cursor.execute("DELETE FROM messages WHERE interview_id = ?", (interview_id,))
     cursor.execute("DELETE FROM interviews WHERE id = ? AND user_id = ?", (interview_id, user_meta["user_id"]))
     
