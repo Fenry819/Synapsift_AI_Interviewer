@@ -371,37 +371,42 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
         
     rag_context = docs[0].page_content if docs else "Core computer systems engineering."
 
-    # === 🛡️ PRODUCTION GATEWAY HOSTILITY TRAP ===
-    # 1. Check for thousands of profanities and leetspeak bypasses instantly
-    is_profane = profanity.contains_profanity(payload.message)
+    # === 🛡️ PRODUCTION GATEWAY: FAIL-FAST TRAP ===
     
-    # 2. Check for explicit interview resignation (non-swear words)
-    resignation_keywords = ["give up", "i won't", "refuse", "stop asking"]
+    # 1. Hardcoded Fail-Fast: Profanity & Explicit Resignations
+    is_profane = profanity.contains_profanity(payload.message)
+    resignation_keywords = ["give up", "i won't", "refuse", "stop asking", "i quit", "pass", "skip"]
     is_resigning = any(word in payload.message.lower() for word in resignation_keywords)
 
     if is_profane or is_resigning:
-        next_question = "[TERMINATE]"
+        # Use specific tags for the backend handler
+        next_question = "[TERMINATE_PROFANITY]" if is_profane else "[TERMINATE_RESIGNATION]"
     else:
-        # --- HYBRID INTERVIEWER PROMPT (Strict + Conversational) ---
+        # 2. AI Reasoning: Handle complex/nuanced behavior
         prompt = HumanMessage(
-            content=f"""You are a strict, busy Senior Staff Engineer conducting a technical interview. YOU ARE NOT AN AI ASSISTANT. 
+            content=f"""You are a strict, busy Senior Staff Engineer. 
             Candidate just said: "{payload.message}"
-            Next technical topic to test: {rag_context}
+            Next topic context: {rag_context}
             
-            CRITICAL DIRECTIVES:
-            1. FIRST-PERSON ONLY: Speak directly to the candidate using "I" and "you". NEVER refer to "the candidate" in the third person. NEVER output bullet points, numbered lists, or internal thoughts.
-            2. THE TERMINATION PROTOCOL: If the candidate explicitly refuses to answer or says they give up, you MUST output this exact string and absolutely nothing else: [TERMINATE]
-            3. NO CUSTOMER SERVICE VOICE: NEVER say "I understand", "Let's move forward", or give moral lectures. You are a blunt human engineer, not a polite chatbot.
-            4. REACT NATURALLY TO DODGING: If they give a dismissive answer like "ok", "uhh", or "sure", do not just move on. Politely but firmly ask them to elaborate on the actual concept. BANNED FILLER: Never say "Got it" or "Great" if they didn't actually answer.
-            5. BLIND RULE: The candidate CANNOT see the textbook context. NEVER refer to "this list", "this table", or "the text". 
-            6. Ask exactly ONE distinct technical question based on the topic. Keep your response conversational and under 4 sentences.
+            DIRECTIVES:
+            1. BLIND RULE: Never mention "Figure", "Table", "Section", "Chapter", or "Illustration". Translate them to verbal descriptions.
+            2. FORMATTING: NEVER use bullet points, numbered lists, or internal thoughts.
+            3. NO FLUFF: No moral lectures. No customer service voice.
+            4. Ask exactly ONE technical question. If they say "ok" or "sure", ask them to elaborate.
+            5. If they are being abusive or dodging in a subtle way I missed, output: [TERMINATE_RESIGNATION]
             """
         )
         next_question = generate_ai_response([prompt], task_type="chat")
 
+    # --- TERMINATION HANDLER ---
     is_completed = False
-    if "[TERMINATE]" in next_question:
-        next_question = "Thank you for your responses today. We have gathered sufficient data to conclude this technical screening. Best of luck, and please proceed to your evaluation!"
+    
+    if "[TERMINATE_PROFANITY]" in next_question:
+        next_question = "Interview terminated: Professional conduct violation detected."
+        is_completed = True
+        
+    elif "[TERMINATE_RESIGNATION]" in next_question:
+        next_question = "Interview terminated: Resignation or refusal detected."
         is_completed = True
 
     cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk) VALUES (?, 'ai', ?, ?)", 
