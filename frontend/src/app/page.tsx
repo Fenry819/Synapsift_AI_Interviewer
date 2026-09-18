@@ -211,6 +211,13 @@ export default function SynapSiftScreener() {
       const data = await response.json();
       setInterviewId(data.interview_id);
       setMessages([{ id: Date.now().toString(), sender: 'ai', text: data.first_question, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
+      
+      // === 🛑 THE UI LOCK GUARDRAIL ===
+      // If the backend instantly rejects the role, lock the chat box!
+      if (data.status === 'COMPLETED') {
+        setIsInterviewComplete(true); 
+      }
+
     } catch (error) {
       console.error(error);
     } finally {
@@ -492,10 +499,25 @@ export default function SynapSiftScreener() {
                   </>
                 ) : (
                   <div className="flex flex-col items-center justify-center p-4 bg-slate-950 border border-slate-800 rounded-xl gap-3">
-                    <p className="text-sm text-slate-400">The technical assessment has been concluded.</p>
-                    <button onClick={() => handleTerminate()} className="text-sm font-medium bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-500/20 px-6 py-2.5 rounded-lg transition flex items-center gap-2">
-                      <CheckCircle size={16} /> End Interview & Get Result
-                    </button>
+                    {messages.length > 0 && (
+                      messages[messages.length - 1].text.includes("unable to conduct") || 
+                      messages[messages.length - 1].text.includes("session is closed") ||
+                      messages[messages.length - 1].text.includes("unwilling to proceed")
+                    ) ? (
+                      <>
+                        <p className="text-sm text-red-400 font-medium">Session closed due to domain constraints or policy violation.</p>
+                        <button onClick={() => { setUploadedFile(null); setInterviewId(null); setCurrentStep('SETUP'); }} className="text-sm font-medium bg-slate-800 hover:bg-slate-700 text-white px-6 py-2.5 rounded-lg transition flex items-center gap-2 border border-slate-700">
+                          <RefreshCw size={16} /> Return to Setup
+                        </button>
+                      </>
+                    ) : (
+                      <>
+                        <p className="text-sm text-slate-400">The technical assessment has been concluded.</p>
+                        <button onClick={() => handleTerminate()} className="text-sm font-medium bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-500/20 px-6 py-2.5 rounded-lg transition flex items-center gap-2">
+                          <CheckCircle size={16} /> End Interview & Get Result
+                        </button>
+                      </>
+                    )}
                   </div>
                 )}
                 

@@ -105,9 +105,9 @@ def generate_ai_response(messages: list, task_type: str = "chat") -> str:
     if task_type == "chat":
         if OPENROUTER_API_KEY:
             try:
-                print("🌐 Querying OpenRouter (NVIDIA Nemotron 30B Free) for Chat...")
+                print("🌐 Querying OpenRouter (NVIDIA Nemotron-3-ultra-550b) for Chat...")
                 llm_openrouter = ChatOpenAI(
-                    model="nvidia/nemotron-3-nano-30b-a3b:free", 
+                    model="nvidia/nemotron-3-ultra-550b-a55b:free", 
                     api_key=OPENROUTER_API_KEY,
                     base_url="https://openrouter.ai/api/v1"
                 )
@@ -312,36 +312,62 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
         
     rag_context = docs[0].page_content if docs else "General software engineering and machine learning principles."
 
-    prompt = HumanMessage(
-        content=f"""You are a professional technical interviewer for a {role} position.
-        Candidate Resume Extract: {resume_text}
-        Approved Textbook Context: {rag_context}
-        
-        Instructions:
-        1. Parse the resume silently. Identify their top Skills, Technologies, and Domain exposure.
-        2. Greet the candidate warmly and state ONE specific skill you see on their resume.
-        3. Ask EXACTLY ONE challenging technical question derived from the Approved Textbook Context.
-        
-        CRITICAL OUTPUT GUARDRAIL:
-        Output ONLY the verbal text spoken out loud to the candidate. Do not write any thoughts, explanations, metadata, or wrappers like 'Question:'."""
-    )
-    first_question = generate_ai_response([prompt], task_type="chat")
+    # === 🛡️ PYTHON DOMAIN GATEKEEPER (Fail-Fast) ===
+    # Catch non-tech roles instantly in Python so the LLM doesn't get confused
+    invalid_domains = ["yoga", "gym", "fitness", "chef", "plumber", "sales", "hr", "driver", "retail", "medical"]
+    
+    if any(word in role.lower() for word in invalid_domains):
+        first_question = "[DOMAIN_REJECT]"
+    else:
+        # --- AI GENERATION FOR VALID ROLES ---
+        prompt = HumanMessage(
+            content=f"""
+            [SYSTEM: SENIOR STAFF ENGINEER]
+            Candidate Role: {role}
+            Resume Extract: {resume_text[:300]}
+            Technical Topic: {rag_context}
+            
+            STRICT RULES:
+            1. NO MULTIPLE CHOICE: NEVER ask multiple-choice questions. NEVER give options (A, B, C, D). 
+            2. OPEN-ENDED ONLY: Ask an open-ended, conversational question that forces the candidate to explain the concept.
+            3. NO LISTS: NEVER use bullet points or numbered lists.
+            4. Greet the candidate and mention ONE tech skill from their resume.
+            5. Ask EXACTLY ONE technical question based on the topic. Keep it under 3 sentences.
+            6. BLIND RULE: NEVER use the words "textbook", "context", "Figure", "Table", or "quote".
+            """
+        )
+        first_question = generate_ai_response([prompt], task_type="chat")
+
+    # --- DOMAIN REJECTION HANDLER ---
+    if "[DOMAIN_REJECT]" in first_question:
+        first_question = f"Thank you for your interest in the {role} position. However, this platform is explicitly designed to evaluate candidates for Software Engineering, Data Science, and AI roles. We are unable to conduct a technical screening for this specific domain. We appreciate your time and wish you the best in your job search!"
+        initial_status = "COMPLETED"
+    else:
+        initial_status = "ONGOING"
 
     conn = sqlite3.connect("synapsift.db")
     cursor = conn.cursor()
-    cursor.execute("INSERT INTO interviews (id, user_id, target_role, resume_text, resume_url, status) VALUES (?, ?, ?, ?, ?, 'ONGOING')", 
-                  (interview_id, user_meta["user_id"], role, resume_text, resume_url))
+    cursor.execute("INSERT INTO interviews (id, user_id, target_role, resume_text, resume_url, status) VALUES (?, ?, ?, ?, ?, ?)", 
+                  (interview_id, user_meta["user_id"], role, resume_text, resume_url, initial_status))
     cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk) VALUES (?, 'ai', ?, ?)", 
-                  (interview_id, first_question, rag_context))
+                  (interview_id, first_question, "System Guardrail" if initial_status == "COMPLETED" else rag_context))
     conn.commit()
     conn.close()
 
-    return {"interview_id": interview_id, "first_question": first_question, "status": "ONGOING"}
+    return {"interview_id": interview_id, "first_question": first_question, "status": initial_status}
 
 @app.post("/api/interview/chat")
 async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current_user)):
     conn = sqlite3.connect("synapsift.db")
     cursor = conn.cursor()
+    
+    # === 🛑 ZOMBIE CHAT GUARDRAIL ===
+    # Check if the interview was already rejected or completed
+    cursor.execute("SELECT status FROM interviews WHERE id = ?", (payload.interview_id,))
+    status_row = cursor.fetchone()
+    if not status_row or status_row[0] == 'COMPLETED':
+        conn.close()
+        return {"reply": "This interview session has already been concluded.", "status": "COMPLETED"}
     
     cursor.execute("SELECT COUNT(*) FROM messages WHERE interview_id = ? AND sender = 'candidate'", (payload.interview_id,))
     turns_taken = cursor.fetchone()[0]
@@ -373,27 +399,37 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
 
     # === 🛡️ PRODUCTION GATEWAY: FAIL-FAST TRAP ===
     
-    # 1. Hardcoded Fail-Fast: Profanity & Explicit Resignations
+    # 1. Expanded Hardcoded Fail-Fast: Profanity, Hostility & Resignations
     is_profane = profanity.contains_profanity(payload.message)
-    resignation_keywords = ["give up", "i won't", "refuse", "stop asking", "i quit", "pass", "skip"]
-    is_resigning = any(word in payload.message.lower() for word in resignation_keywords)
+    hostile_keywords = [
+        "give up", "i won't", "refuse", "stop asking", "i quit", "pass", "skip",
+        "shut up", "go away", "fck", "stfu", "bullshit", "waste of time", "fuck off"
+    ]
+    is_resigning = any(word in payload.message.lower() for word in hostile_keywords)
 
     if is_profane or is_resigning:
-        # Use specific tags for the backend handler
         next_question = "[TERMINATE_PROFANITY]" if is_profane else "[TERMINATE_RESIGNATION]"
     else:
-        # 2. AI Reasoning: Handle complex/nuanced behavior
+        # 2. AI Reasoning: Direct, Non-Conditional Logic
+        candidate_name = user_meta.get("name", "the candidate")
+        
         prompt = HumanMessage(
-            content=f"""You are a strict, busy Senior Staff Engineer. 
+            content=f"""
+            [SYSTEM ROLE: SENIOR STAFF ENGINEER]
+            Candidate Name: {candidate_name}
             Candidate just said: "{payload.message}"
-            Next topic context: {rag_context}
+            Next technical topic: {rag_context}
             
-            DIRECTIVES:
-            1. BLIND RULE: Never mention "Figure", "Table", "Section", "Chapter", or "Illustration". Translate them to verbal descriptions.
-            2. FORMATTING: NEVER use bullet points, numbered lists, or internal thoughts.
-            3. NO FLUFF: No moral lectures. No customer service voice.
-            4. Ask exactly ONE technical question. If they say "ok" or "sure", ask them to elaborate.
-            5. If they are being abusive or dodging in a subtle way I missed, output: [TERMINATE_RESIGNATION]
+            [INSTRUCTIONS]
+            You are currently interviewing {candidate_name}. 
+            If they said "I don't know", "not sure", or gave a weak answer, acknowledge it coldly and move on.
+            Ask exactly ONE new technical question based on the topic. Keep it strictly under 3 sentences.
+            
+            [STRICT BAN LIST]
+            1. NO LISTS: Never output numbered lists, options, or bullet points.
+            2. NO THIRD PERSON: Speak directly to {candidate_name} using "you". NEVER refer to "the candidate".
+            3. BLIND RULE: Never mention "Figure", "Table", "Section", "textbook", or random textbook authors/names (e.g., Sarah, Winn, Zisserman).
+            4. NO AI VOICE: Do not be overly polite. Be direct and blunt.
             """
         )
         next_question = generate_ai_response([prompt], task_type="chat")
@@ -402,11 +438,11 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
     is_completed = False
     
     if "[TERMINATE_PROFANITY]" in next_question:
-        next_question = "Interview terminated: Professional conduct violation detected."
+        next_question = "I'm ending the interview right here. We maintain strict professional standards for our engineers, and that kind of language is completely unacceptable. This session is closed."
         is_completed = True
         
     elif "[TERMINATE_RESIGNATION]" in next_question:
-        next_question = "Interview terminated: Resignation or refusal detected."
+        next_question = "If you are unwilling to proceed with the technical questions, we will conclude the assessment here. Thank you for your time."
         is_completed = True
 
     cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk) VALUES (?, 'ai', ?, ?)", 
@@ -452,6 +488,39 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
         elif sender == 'candidate' and current_question:
             qa_pairs.append({"question": current_question, "answer": text})
             current_question = None
+
+    # === 🛑 TOKEN SAVER: BYPASS LLM FOR TERMINATIONS & REJECTIONS ===
+    # Look at the final message the AI sent
+    last_ai_msg = next((text for sender, text in reversed(rows) if sender == 'ai'), "")
+    
+    # If the transcript is empty (Domain Reject) or contains our termination strings
+    is_rejected = len(qa_pairs) == 0
+    is_terminated = "session is closed" in last_ai_msg or "unwilling to proceed" in last_ai_msg or "unable to conduct" in last_ai_msg
+
+    if is_rejected or is_terminated:
+        parsed_json = {
+            "overallScore": 0,
+            "summary": "Interview terminated early due to domain rejection, resignation, or policy violation.",
+            "insights": "Automated failure. The LLM evaluation phase was bypassed to conserve system resources.",
+            "breakdown": [
+                {
+                    "question": qa["question"],
+                    "answer": qa["answer"],
+                    "score": 0,
+                    "feedback": "Score voided due to early termination."
+                } for qa in qa_pairs
+            ]
+        }
+        
+        # Save bypass result directly to database
+        json_str = json.dumps(parsed_json)
+        cursor.execute("UPDATE interviews SET overall_score = 0, evaluation_summary = ?, evaluation_data = ?, status = 'COMPLETED' WHERE id = ?", 
+                      (parsed_json["summary"], json_str, interview_id))
+        conn.commit()
+        
+        parsed_json["resume_url"] = row[1] if row else None
+        conn.close()
+        return parsed_json
 
     # --- COMPLETE TRANSCRIPT EVALUATION ---
     verification_payload = json.dumps(qa_pairs, indent=2)
