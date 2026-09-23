@@ -410,26 +410,27 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
     if is_profane or is_resigning:
         next_question = "[TERMINATE_PROFANITY]" if is_profane else "[TERMINATE_RESIGNATION]"
     else:
-        # 2. AI Reasoning: Direct, Non-Conditional Logic
+        # 2. AI Reasoning: Dynamic Follow-Ups and Escapes
         candidate_name = user_meta.get("name", "the candidate")
         
         prompt = HumanMessage(
             content=f"""
             [SYSTEM ROLE: SENIOR STAFF ENGINEER]
             Candidate Name: {candidate_name}
-            Candidate just said: "{payload.message}"
-            Next technical topic: {rag_context}
+            Candidate's Answer: "{payload.message}"
+            Available New Topic: {rag_context}
             
             [INSTRUCTIONS]
-            You are currently interviewing {candidate_name}. 
-            If they said "I don't know", "not sure", or gave a weak answer, acknowledge it coldly and move on.
-            Ask exactly ONE new technical question based on the topic. Keep it strictly under 3 sentences.
+            1. JUDGE & REACT: 
+               - If their answer is lazy, vague, or short (e.g., "I don't know" or "just test it"): DO NOT conclude. You MUST push back aggressively. Ask a tough follow-up question demanding technical specifics.
+               - If their answer is strong and detailed: Ask a NEW question based on the Available New Topic.
+            2. DYNAMIC ENDING: Output EXACTLY [CONCLUDE_INTERVIEW] ONLY if the candidate has given highly detailed, masterful answers and you are completely satisfied. Never conclude after a weak or lazy answer!
             
             [STRICT BAN LIST]
-            1. NO LISTS: Never output numbered lists, options, or bullet points.
-            2. NO THIRD PERSON: Speak directly to {candidate_name} using "you". NEVER refer to "the candidate".
-            3. BLIND RULE: Never mention "Figure", "Table", "Section", "textbook", or random textbook authors/names (e.g., Sarah, Winn, Zisserman).
-            4. NO AI VOICE: Do not be overly polite. Be direct and blunt.
+            1. NO LISTS: Never output numbered lists or bullet points.
+            2. NO THIRD PERSON: Speak directly to {candidate_name} using "you".
+            3. BLIND RULE: Never mention "Figure", "Table", "Section", or "textbook".
+            4. Keep your response strictly under 3 sentences.
             """
         )
         next_question = generate_ai_response([prompt], task_type="chat")
@@ -443,6 +444,10 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
         
     elif "[TERMINATE_RESIGNATION]" in next_question:
         next_question = "If you are unwilling to proceed with the technical questions, we will conclude the assessment here. Thank you for your time."
+        is_completed = True
+        
+    elif "[CONCLUDE_INTERVIEW]" in next_question:
+        next_question = "Thank you, that gives me a solid understanding of your technical depth. We've covered everything I need today. I wish you the best, and you can proceed to generate your results now!"
         is_completed = True
 
     cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk) VALUES (?, 'ai', ?, ?)", 
