@@ -1,6 +1,28 @@
-﻿node_modules/
-.env
-__pycache__/
-venv/
+﻿# Node / Next.js
+node_modules/
 .next/
+
+# Environment files
+.env
+backend/.env
+
+# Python
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+backend/venv/
+
+# SQLite / runtime DBs
+*.db
+*.sqlite
 *.sqlite3
+backend/synapsift.db
+
+# Qdrant runtime data
+backend/qdrant_db/
+backend/qdrant_db_old/
+
+# Candidate uploads
+backend/uploads/*
+!backend/uploads/.gitkeep

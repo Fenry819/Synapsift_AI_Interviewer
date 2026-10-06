@@ -117,13 +117,26 @@ export default function SynapSiftScreener() {
     }
   };
 
+  // FastAPI errors carry `detail` as a string (HTTPException) or a list (validation errors).
+  const getErrorMessage = (data: unknown, fallback: string): string => {
+    const detail = (data as { detail?: unknown } | null)?.detail;
+    return typeof detail === 'string' && detail ? detail : fallback;
+  };
+
   const handleAbortSession = async () => {
     if (!confirm("WARNING: Are you sure you want to exit? This interview will NOT be saved or graded, and all progress will be permanently lost.")) return;
     try {
-      await fetch(`http://127.0.0.1:8000/api/interview/abort/${interviewId}`, {
-        method: 'DELETE',
-        headers: { 'Authorization': `Bearer ${userToken}` }
-      });
+      // No interview was ever created (e.g. start failed): there is nothing to delete server-side.
+      if (interviewId) {
+        const response = await fetch(`http://127.0.0.1:8000/api/interview/abort/${interviewId}`, {
+          method: 'DELETE',
+          headers: { 'Authorization': `Bearer ${userToken}` }
+        });
+        if (!response.ok) {
+          const data = await response.json().catch(() => null);
+          return alert(getErrorMessage(data, "Could not abort the session. Please try again."));
+        }
+      }
       setUploadedFile(null);
       setMessages([]);
       setInterviewId(null);
@@ -208,7 +221,14 @@ export default function SynapSiftScreener() {
         headers: { 'Authorization': `Bearer ${userToken}` },
         body: formData,
       });
-      const data = await response.json();
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data?.interview_id) {
+        alert(getErrorMessage(data, "Could not start the interview. Please try again."));
+        setInterviewId(null);
+        setMessages([]);
+        setCurrentStep('SETUP');
+        return;
+      }
       setInterviewId(data.interview_id);
       setMessages([{ id: Date.now().toString(), sender: 'ai', text: data.first_question, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
       
@@ -244,8 +264,15 @@ export default function SynapSiftScreener() {
         headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${userToken}` },
         body: JSON.stringify({ interview_id: interviewId, message: candidateMsg.text, role: selectedRole === 'Custom Role' ? customRole.trim() : selectedRole })
       });
-      const data = await response.json();
-      
+      const data = await response.json().catch(() => null);
+      if (!response.ok || typeof data?.reply !== 'string') {
+        // The answer was not accepted: take it out of the chat and give it back to the user.
+        alert(getErrorMessage(data, "Your answer could not be sent. Please try again."));
+        setMessages((prev) => prev.filter((m) => m.id !== candidateMsg.id));
+        setInputAnswer(candidateMsg.text);
+        return;
+      }
+
       // Add the AI's message to the chat
       setMessages((prev) => [...prev, { id: (Date.now() + 1).toString(), sender: 'ai', text: data.reply, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
 
@@ -271,9 +298,18 @@ export default function SynapSiftScreener() {
       const response = await fetch(`http://127.0.0.1:8000/api/interview/summary/${idToFetch}`, {
         headers: { 'Authorization': `Bearer ${userToken}` }
       });
-      setAnalysisReport(await response.json());
+      const data = await response.json().catch(() => null);
+      if (!response.ok || !data) {
+        // Admin opened this from the dashboard; a candidate retries from the finished chat screen.
+        alert(getErrorMessage(data, "Could not load the evaluation. Please try again."));
+        setCurrentStep(specificId ? 'ADMIN' : 'INTERVIEW');
+        return;
+      }
+      setAnalysisReport({ ...data, breakdown: Array.isArray(data.breakdown) ? data.breakdown : [] });
     } catch (error) {
       console.error(error);
+      alert("Could not reach the server. Please try again.");
+      setCurrentStep(specificId ? 'ADMIN' : 'INTERVIEW');
     } finally {
       setIsEvaluating(false); 
     }
