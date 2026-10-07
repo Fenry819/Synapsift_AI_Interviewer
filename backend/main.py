@@ -28,6 +28,7 @@ from resume_profile import (
 import rag_config as rag_cfg
 from rag import retrieve_context, build_rag_trace, knowledge_base_status, RetrievalResult
 from llm_providers import generate_chat_response, call_local_llm, ProviderUnavailableError
+from interview_style import CLOSING_MESSAGE
 from interview_engine import (
     TurnContext, classify_answer, conclusion_allowed, dump_state, fresh_state, generate_interviewer_turn,
     history_from_messages, load_state, plan_next_step, record_question,
@@ -336,7 +337,8 @@ def load_turn_history(cursor, interview_id: str):
 
 # Canned texts authored by the backend itself (never by a model)
 RESIGNATION_MESSAGE = "If you are unwilling to proceed with the technical questions, we will conclude the assessment here. Thank you for your time."
-CONCLUSION_MESSAGE = "Thank you, that gives me a solid understanding of your technical depth. We've covered everything I need today. I wish you the best, and you can proceed to generate your results now!"
+# Normal ending (model-requested conclusion or the answer limit): no score, no verdict, no mention of how it is evaluated.
+CONCLUSION_MESSAGE = CLOSING_MESSAGE
 
 def build_interview_context(target_role: str, candidate_profile: dict, answer_number: int) -> dict:
     """Compact per-turn context built from stored data only (never from client input)."""
@@ -441,7 +443,7 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
         turn_ctx = TurnContext(
             target_role=role, domain=domain, profile=candidate_profile, answer_number=0, max_answers=MAX_CANDIDATE_ANSWERS,
             state=state, plan=plan, quality=None, turns=[], previous_questions=[], reference=retrieval.selected,
-            latest_answer=None, conclusion_allowed=False)
+            latest_answer=None, conclusion_allowed=False, candidate_name=user_meta.get("name"))
         try:
             outcome = generate_interviewer_turn(turn_ctx, generate_chat_response, embed_texts)
         except ProviderUnavailableError as e:
@@ -461,7 +463,8 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
     used_chunk = used_retrieval.selected if used_retrieval else None
     state_json = None
     if outcome is not None:
-        state_json = dump_state(record_question(state, plan, outcome.topic, used_chunk.chunk_id if used_chunk else None))
+        state_json = dump_state(record_question(state, plan, outcome.topic, used_chunk.chunk_id if used_chunk else None,
+                                                preamble=outcome.preamble))
 
     conn = sqlite3.connect("synapsift.db")
     cursor = conn.cursor()
@@ -538,7 +541,7 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
     is_resigning = is_explicit_resignation(payload.message)
 
     if answer_number >= MAX_CANDIDATE_ANSWERS and not is_resigning:
-        closing_msg = "Thank you so much for your time today. We've covered a lot of ground, and I have all the information I need. I wish you the best of luck, and you can proceed to generate your evaluation results now!"
+        closing_msg = CLOSING_MESSAGE
         cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk, rag_trace, llm_provider, llm_model) VALUES (?, 'ai', ?, ?, ?, ?, ?)",
                       (payload.interview_id, closing_msg, "System Hard Stop",
                        json.dumps(build_rag_trace(None, target_role, reason_override="interview answer limit reached")),
@@ -566,8 +569,9 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
         state = load_state(stored_state, profile)
         pairs, previous_questions = load_turn_history(cursor, payload.interview_id)   # includes this answer
         last_question = pairs[-1][0] if pairs else None
-        quality = classify_answer(payload.message, last_question, state.current_topic, embed_texts)
-        state, plan = plan_next_step(state, quality, domain, previous_questions)
+        quality = classify_answer(payload.message, last_question, state.current_topic, embed_texts, profane=is_profane)
+        state, plan = plan_next_step(state, quality, domain, previous_questions,
+                                     answer_number=answer_number, max_answers=MAX_CANDIDATE_ANSWERS)
 
         # Role-aware retrieval from trusted context. Chunks already used in this interview are skipped; the
         # candidate's answer only nudges the query.
@@ -579,7 +583,7 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
             target_role=target_role, domain=domain, profile=profile, answer_number=answer_number,
             max_answers=MAX_CANDIDATE_ANSWERS, state=state, plan=plan, quality=quality, turns=pairs,
             previous_questions=previous_questions, reference=retrieval.selected, latest_answer=payload.message,
-            conclusion_allowed=conclusion_allowed(answer_number, state))
+            conclusion_allowed=conclusion_allowed(answer_number, state), candidate_name=user_meta.get("name"))
         try:
             outcome = generate_interviewer_turn(turn_ctx, generate_chat_response, embed_texts)
         except ProviderUnavailableError as e:
@@ -604,7 +608,8 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
             else:
                 trace_retrieval = retrieval
             used_chunk = trace_retrieval.selected if trace_retrieval else None
-            new_state_json = dump_state(record_question(state, plan, outcome.topic, used_chunk.chunk_id if used_chunk else None))
+            new_state_json = dump_state(record_question(state, plan, outcome.topic, used_chunk.chunk_id if used_chunk else None,
+                                                        preamble=outcome.preamble))
 
     selected_chunk = trace_retrieval.selected if trace_retrieval else None
     # Canned text (resignation) is the system's; a question is attributed to whoever produced it.

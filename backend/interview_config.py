@@ -38,9 +38,25 @@ IRRELEVANT_MAX_WORDS = 15           # only short replies can be called irrelevan
 IRRELEVANT_MAX_SIMILARITY = 0.11    # answer<->question cosine similarity below this (and no shared terms)
 STRONG_MIN_WORDS = 35
 STRONG_MIN_RELEVANT_TERMS = 4
+STRONG_MIN_SPECIFIC_TERMS = 3       # a long answer made of filler / the question's own words is not 'strong'
+# 'vague' = enough words but (almost) nothing beyond the question's own words and generic filler ("circular").
+VAGUE_MIN_CONTENT_WORDS = 3
+VAGUE_MAX_SPECIFIC_TERMS = 1
+
+# --- depth: a strong answer SOMETIMES earns one deeper follow-up on the same topic ------------------------------
+# Rule: the 1st, 3rd, 5th ... strong topic gets one deeper probe (never every strong answer), at most MAX_DEEP_PROBES
+# per interview, only while at least MIN_ANSWERS_LEFT_FOR_DEEP_PROBE answers remain, and never twice on one topic.
+MAX_DEEP_PROBES = 3
+MIN_ANSWERS_LEFT_FOR_DEEP_PROBE = 3
 
 # --- question validation ------------------------------------------------------------------------
 MIN_QUESTION_CHARS = 15
 MAX_QUESTION_CHARS = 450
-MAX_QUESTION_SENTENCES = 3          # brief acknowledgement + the question
+MAX_QUESTION_SENTENCES = 3          # default limit of validate_question()
 MAX_TOPIC_CHARS = 60
+
+# --- candidate-facing message = backend-chosen greeting/transition + the model's technical question ---
+MAX_BODY_SENTENCES = 2              # what the MODEL may write: the question plus at most one clarifying sentence
+MAX_DISPLAY_SENTENCES = 5           # the composed message (greeting/transition + question)
+MAX_DISPLAY_CHARS = 700
+MAX_RECENT_PREAMBLES = 3            # transitions remembered so wording is not repeated back-to-back
