@@ -278,6 +278,28 @@ def appeal_reaction(label: str | None, follow: bool, appeal_count: int, rotation
     return ("appeal_repeat" if repeat else "appeal_first"), text
 
 
+# --- conduct (severe abuse aimed at the interviewer) --------------------------------------------------------------
+# Warning 1 is professional, warning 2 is firmer; neither mentions scores, results, pass/fail or hiring, and neither has a
+# question mark (the model's technical question follows). The termination message is neutral and final.
+CONDUCT_WARNINGS = {
+    1: ["I'd like to keep this interview respectful and professional, so please avoid abusive language. Let's continue with the technical questions.",
+        "Please keep the conversation respectful and professional. Let's get back to the technical questions."],
+    2: ["This is a second reminder: abusive language isn't acceptable here, and the interview will be concluded if it continues. Please keep to the technical questions.",
+        "I need to remind you again to keep this interview professional; if the abusive language continues, the interview will be concluded. Let's return to the technical questions."],
+}
+CONDUCT_TERMINATION_MESSAGE = ("This interview is being concluded because the conversation has repeatedly moved away from professional "
+                               "participation despite prior reminders. Your responses up to this point will remain available for review.")
+CONDUCT_TERMINATION_REASON = "conduct_termination"
+
+
+def conduct_warning(level: int, rotation: int, recent: list) -> tuple:
+    """-> (kind, text) for warning level 1 or 2 (rotating, not repeating the last turns' wording)."""
+    level = 2 if level >= 2 else 1
+    options = CONDUCT_WARNINGS[level]
+    ordered = [options[(rotation + i) % len(options)] for i in range(len(options))]
+    return f"conduct_warning_{level}", next((o for o in ordered if o not in recent), ordered[0])
+
+
 # --- closing ----------------------------------------------------------------------------------------------------
 # Shown when the interview ends normally (model-requested conclusion after the minimum, or the answer limit).
 # No score, no verdict, no mention of how or by what the answers are evaluated.

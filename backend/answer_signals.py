@@ -176,3 +176,32 @@ GENERIC_FILLER = frozenset("""give gives gave make makes made type types kind ki
 help helps good bad important basically simply actually something someone anything everything know knowledge machine model models data
 learn learning learns just really very also like many much lot lots different various certain related called named based part parts
 process get gets got go goes one two simple terms term role play plays played""".split())
+
+
+# --------------------------------------------------------------------------------------------------------------
+# Conduct: severe abuse aimed at the interviewer (the only thing that counts as a conduct strike)
+# --------------------------------------------------------------------------------------------------------------
+_CLAUSE = re.compile(r"[.,;!?\n]+")
+_TARGET_AFTER = frozenset({"you", "u", "ya", "your", "ur", "yourself", "off", "out", "away"})
+_SECOND_PERSON = frozenset({"you", "u", "ur", "youre", "you're", "ya"})
+_COPULA = frozenset({"are", "r", "re", "is", "being"})
+
+
+def is_severe_abuse(text: str, is_profane_word) -> bool:
+    """True for profanity/slurs clearly AIMED at the interviewer: 'fuck you', 'fuck off', 'get the fuck out', 'shut the fuck up',
+    'you are a <profane word>'. A swear word on its own, slang, jokes and casual use ('when you fuck up the split') are not.
+    `is_profane_word(token) -> bool` is the app's profanity check (better_profanity), so no phrase list is kept here."""
+    for clause in _CLAUSE.split((text or "").lower()):
+        tokens = re.findall(r"[a-z']+", clause)
+        for i, tok in enumerate(tokens):
+            if not is_profane_word(tok):
+                continue
+            after = tokens[i + 1:i + 3]
+            before = tokens[max(0, i - 3):i]
+            if any(t in _TARGET_AFTER for t in after):                                   # "fuck you", "fuck off", "the fuck out"
+                return True
+            if "shut" in before and after[:1] == ["up"]:                                 # "shut the fuck up"
+                return True
+            if any(t in _SECOND_PERSON for t in before) and (any(t in _COPULA for t in before) or any(t in ("youre", "you're") for t in before)):
+                return True                                                              # "you are a fucking idiot", "you're such a bitch"
+    return False

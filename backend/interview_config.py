@@ -61,3 +61,7 @@ MAX_BODY_SENTENCES = 2              # what the MODEL may write: the question plu
 MAX_DISPLAY_SENTENCES = 5           # the composed message (greeting/transition + question)
 MAX_DISPLAY_CHARS = 700
 MAX_RECENT_PREAMBLES = 3            # transitions remembered so wording is not repeated back-to-back
+
+# --- conduct strikes (severe abuse aimed at the interviewer; separate from technical quality) ---
+CONDUCT_TERMINATE_STRIKES = 3       # the Nth severe incident ends the interview (1st = warning, 2nd = firmer warning)
+CONDUCT_EARLY_CONSECUTIVE = 2       # ...or this many consecutive severe turns AFTER a warning/professionalism reminder was already given

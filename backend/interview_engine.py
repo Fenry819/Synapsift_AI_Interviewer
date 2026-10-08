@@ -216,6 +216,9 @@ class InterviewState(BaseModel):
     deep_probed_topics: list[str] = Field(default_factory=list) # topics that already got one deeper follow-up
     bad_attempts: int = 0                # poor answers so far on current_topic (weak/vague/incorrect/irrelevant/dismissive)
     appeal_count: int = 0                # answers so far that contained a personal / job appeal
+    conduct_strikes: int = 0             # severe incidents (abuse aimed at the interviewer) so far; independent of technical quality
+    conduct_warnings: int = 0            # conduct warnings issued
+    conduct_consecutive: int = 0         # consecutive severe turns that came AFTER a warning / professionalism reminder
     last_bad_faith: bool = False         # the previous answer was nonsense / mockery / dismissive-or-unprofessional and poor (not an honest miss)
 
     @field_validator("difficulty")
@@ -279,6 +282,7 @@ class AnswerQuality:
     behavior_signals: list = field(default_factory=list)
     confident: bool = False
     appeal: bool = False             # personal / job-outcome appeal present (independent of technical quality and behaviour)
+    severe_abuse: bool = False       # severe abuse aimed at the interviewer (conduct strike candidate; unrelated to technical quality)
     request: str | None = None       # the candidate asked the interviewer for help / a score / a hiring outcome (never technical content)
 
 
@@ -309,7 +313,7 @@ _EVERYDAY_ANCHORS = ["everyday household items, food, animals, clothing, sports 
 
 
 def classify_answer(answer: str, last_question: str | None, topic: str | None,
-                    embed_fn: Callable | None = None, profane: bool = False) -> AnswerQuality:
+                    embed_fn: Callable | None = None, profane: bool = False, severe_abuse: bool = False) -> AnswerQuality:
     """Conservative flow classifier. Anything unclear becomes 'partial'; 'incorrect' needs a recognised misconception.
 
     Behaviour chatter (laughter, slang, 'easy question', dismissals) is stripped BEFORE the technical judgement, so a
@@ -323,7 +327,7 @@ def classify_answer(answer: str, last_question: str | None, topic: str | None,
     signals = {"words": len(words), "content_words": len(content)}
 
     def result(label, reason, behavior=None):
-        return AnswerQuality(label, reason, signals, behavior or beh.label, list(beh.signals), beh.confident, beh.appeal, beh.request)
+        return AnswerQuality(label, reason, signals, behavior or beh.label, list(beh.signals), beh.confident, appeal=beh.appeal, request=beh.request, severe_abuse=severe_abuse)
 
     if not words or not content:
         if not raw:
@@ -419,6 +423,8 @@ class StepPlan:
     depth_probe: bool = False       # follow_up that deepens a STRONG answer (as opposed to clarifying a poor one)
     behavior: str = "normal"
     prior_bad_faith: bool = False   # the answer BEFORE the last one was nonsense/mockery/dismissive (to recognise repeated nonsense)
+    conduct_level: int = 0          # 1 or 2 when this answer earned a conduct warning (shown instead of the usual reaction)
+    conduct_terminate: bool = False # the interview must end now (repeated severe conduct violations)
     appeal: int = 0                 # >0 when the last answer contained a personal/job appeal: how many appeals so far (1 = first)
 
 
@@ -448,6 +454,19 @@ def plan_next_step(state: InterviewState, quality: AnswerQuality | None, domain:
         return s, StepPlan("open", s.difficulty, pick_next_topic(domain, s.asked_topics, previous_questions, profile, seed), None)
 
     label, behavior = quality.label, quality.behavior
+    conduct_level, conduct_terminate = 0, False
+    if quality.severe_abuse:
+        # Conduct strikes are independent of technical quality. 1st severe incident: warning; 2nd: firmer warning; 3rd (or two
+        # consecutive severe turns once a warning / professionalism reminder already exists): the interview ends.
+        warned_before = s.conduct_warnings >= 1 or style.reminder_recent(s.recent_preambles)
+        s.conduct_strikes += 1
+        s.conduct_consecutive = s.conduct_consecutive + 1 if warned_before else 0
+        conduct_terminate = s.conduct_strikes >= cfg.CONDUCT_TERMINATE_STRIKES or s.conduct_consecutive >= cfg.CONDUCT_EARLY_CONSECUTIVE
+        if not conduct_terminate:
+            conduct_level = min(s.conduct_strikes, 2)
+            s.conduct_warnings += 1
+    else:
+        s.conduct_consecutive = 0
     if quality.appeal:                                    # personal / job appeals: counted so repeated pleading gets the firmer wording
         s.appeal_count += 1
     poor = label in style.POOR_LABELS
@@ -484,7 +503,8 @@ def plan_next_step(state: InterviewState, quality: AnswerQuality | None, domain:
         step = "new_topic"
 
     topic = s.current_topic if step in ("follow_up", "redirect") else pick_next_topic(domain, s.asked_topics, previous_questions)
-    return s, StepPlan(step, s.difficulty, topic, label, depth_probe=depth, behavior=behavior, appeal=s.appeal_count if quality.appeal else 0, prior_bad_faith=prior_bad_faith)
+    return s, StepPlan(step, s.difficulty, topic, label, depth_probe=depth, behavior=behavior, appeal=s.appeal_count if quality.appeal else 0, prior_bad_faith=prior_bad_faith,
+                              conduct_level=conduct_level, conduct_terminate=conduct_terminate)
 
 
 def record_question(state: InterviewState, plan: StepPlan, topic: str, chunk_id: str | None,
@@ -913,7 +933,9 @@ def compose_message(ctx: TurnContext, core: str) -> tuple:
     else:
         # reaction = f(step, technical quality, behaviour); a professionalism reminder is not repeated within the recent turns
         reminder_ok = not style.reminder_recent(ctx.state.recent_preambles)
-        if ctx.quality and ctx.quality.request:
+        if ctx.plan.conduct_level:
+            kind, pre = style.conduct_warning(ctx.plan.conduct_level, ctx.answer_number, ctx.state.recent_preambles)
+        elif ctx.quality and ctx.quality.request:
             # asking the interviewer for help / a score / a hiring outcome: a calm, fixed answer (never the answer itself)
             kind, pre = style.request_reaction(ctx.quality.request, label, ctx.plan.step in ("redirect", "follow_up"),
                                                ctx.answer_number, ctx.state.recent_preambles)
@@ -967,6 +989,8 @@ class TurnOutcome:
             "confident": ctx.quality.confident if ctx.quality else None,
             "appeal": ctx.quality.appeal if ctx.quality else None,
             "request": ctx.quality.request if ctx.quality else None,
+            "severe_abuse": ctx.quality.severe_abuse if ctx.quality else None, "conduct_strikes": ctx.state.conduct_strikes,
+            "conduct_warning_level": ctx.plan.conduct_level,
             "reaction_kind": self.preamble_kind, "depth_probe": ctx.plan.depth_probe,
             "max_question_similarity": self.similarity, "core_question": self.core_question,
             "preamble_kind": self.preamble_kind, "preamble": self.preamble,

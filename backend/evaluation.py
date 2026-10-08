@@ -17,7 +17,7 @@ import re
 from dataclasses import dataclass, field
 
 from answer_signals import detect_behavior, strip_markers
-from interview_style import CLOSING_MESSAGE
+from interview_style import CLOSING_MESSAGE, CONDUCT_TERMINATION_MESSAGE
 
 # Bump when the report shape or scoring rules change: cached reports carrying another version are recomputed.
 EVAL_SCHEMA_VERSION = 2
@@ -90,7 +90,7 @@ def _meta(raw) -> dict | None:
 
 def is_canned_text(text: str) -> bool:
     t = text or ""
-    return t.strip() == CLOSING_MESSAGE.strip() or any(m in t for m in _CANNED_MARKERS)
+    return t.strip() in (CLOSING_MESSAGE.strip(), CONDUCT_TERMINATION_MESSAGE.strip()) or any(m in t for m in _CANNED_MARKERS)
 
 
 def _is_question_row(text: str, provider, meta: dict | None) -> bool:
@@ -128,6 +128,8 @@ def build_transcript(rows) -> Transcript:
                 last_pair.behavior = meta["answer_behavior"] if meta["answer_behavior"] in ("normal", "dismissive", "unprofessional") else "normal"
                 last_pair.behavior_signals = list(meta.get("behavior_signals") or [])
                 last_pair.behavior_source = "stored"
+            elif last_pair is not None and meta and meta.get("severe_abuse"):     # conduct termination row: the answer before it was severe abuse
+                last_pair.behavior, last_pair.behavior_signals, last_pair.behavior_source = "unprofessional", ["conduct:severe_abuse"], "stored"
             last_pair = None
             pending = None
             if _is_question_row(text, provider, meta):

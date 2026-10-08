@@ -29,7 +29,8 @@ from resume_profile import (
 import rag_config as rag_cfg
 from rag import retrieve_context, build_rag_trace, knowledge_base_status, RetrievalResult
 from llm_providers import generate_chat_response, call_local_llm, ProviderUnavailableError
-from interview_style import CLOSING_MESSAGE
+from interview_style import CLOSING_MESSAGE, CONDUCT_TERMINATION_MESSAGE, CONDUCT_TERMINATION_REASON
+from answer_signals import is_severe_abuse
 from evaluation import (
     EvaluationUnavailableError, build_transcript, cached_report, evaluate_transcript, terminated_report,
 )
@@ -558,6 +559,7 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
     next_question, is_completed = None, False
     outcome = turn_ctx = None
     trace_retrieval, trace_reason, new_state_json = None, "interview ended", None
+    system_meta = None
 
     if is_resigning:
         # Explicit resignation is decided by Python alone: no retrieval, no provider, canned text.
@@ -571,47 +573,58 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
         state = load_state(stored_state, profile)
         pairs, previous_questions = load_turn_history(cursor, payload.interview_id)   # includes this answer
         last_question = pairs[-1][0] if pairs else None
-        quality = classify_answer(payload.message, last_question, state.current_topic, embed_texts, profane=is_profane)
+        severe_abuse = is_severe_abuse(payload.message, profanity.contains_profanity)
+        quality = classify_answer(payload.message, last_question, state.current_topic, embed_texts, profane=is_profane, severe_abuse=severe_abuse)
         state, plan = plan_next_step(state, quality, domain, previous_questions,
                                      answer_number=answer_number, max_answers=MAX_CANDIDATE_ANSWERS)
 
-        # Role-aware retrieval from trusted context. Chunks already used in this interview are skipped; the
-        # candidate's answer only nudges the query.
-        retrieval = retrieve_for_interview(
-            target_role, profile, interview_context["progress"]["answer_number"], current_answer=payload.message,
-            topic_hint=plan.topic, exclude_chunk_ids=set(state.used_chunk_ids))
-
-        turn_ctx = TurnContext(
-            target_role=target_role, domain=domain, profile=profile, answer_number=answer_number,
-            max_answers=MAX_CANDIDATE_ANSWERS, state=state, plan=plan, quality=quality, turns=pairs,
-            previous_questions=previous_questions, reference=retrieval.selected, latest_answer=payload.message,
-            conclusion_allowed=conclusion_allowed(answer_number, state), candidate_name=user_meta.get("name"))
-        try:
-            outcome = generate_interviewer_turn(turn_ctx, generate_chat_response, embed_texts)
-        except ProviderUnavailableError as e:
-            # Nothing is invented. Withdraw this turn's answer so the transcript and the answer count are
-            # exactly as before the request, and let the candidate resend once a provider is back. The stored
-            # interview state was never touched.
-            print(f"Chat turn aborted for {payload.interview_id}, no LLM provider available: {e}")
-            cursor.execute("DELETE FROM messages WHERE id = ?", (candidate_message_id,))
-            conn.commit()
-            conn.close()
-            raise HTTPException(status_code=503, detail=PROVIDER_UNAVAILABLE_DETAIL)
-
-        if outcome.action == "conclude":
-            # The model asked to end early (allowed only after a minimum number of answers/topics).
-            next_question, is_completed = CONCLUSION_MESSAGE, True
+        if plan.conduct_terminate:
+            # Repeated severe abuse aimed at the interviewer: decided by Python alone (no retrieval, no provider). The answers given
+            # so far are untouched and remain evaluable; this is NOT a resignation and carries its own termination reason.
+            next_question, is_completed = CONDUCT_TERMINATION_MESSAGE, True
             new_state_json = dump_state(state)
-            trace_reason = "interview concluded by the interviewer; closing message"
+            trace_reason = "interview concluded after repeated severe conduct violations"
+            system_meta = {"action": "terminate", "termination_reason": CONDUCT_TERMINATION_REASON, "severe_abuse": True,
+                           "conduct_strikes": state.conduct_strikes, "conduct_warnings": state.conduct_warnings,
+                           "conduct_consecutive_after_warning": state.conduct_consecutive, "answer_number": answer_number}
         else:
-            next_question = outcome.question
-            if outcome.generation == "fallback":
-                trace_reason = "deterministic fallback question; retrieved material was not used"
+            # Role-aware retrieval from trusted context. Chunks already used in this interview are skipped; the
+            # candidate's answer only nudges the query.
+            retrieval = retrieve_for_interview(
+                target_role, profile, interview_context["progress"]["answer_number"], current_answer=payload.message,
+                topic_hint=plan.topic, exclude_chunk_ids=set(state.used_chunk_ids))
+
+            turn_ctx = TurnContext(
+                target_role=target_role, domain=domain, profile=profile, answer_number=answer_number,
+                max_answers=MAX_CANDIDATE_ANSWERS, state=state, plan=plan, quality=quality, turns=pairs,
+                previous_questions=previous_questions, reference=retrieval.selected, latest_answer=payload.message,
+                conclusion_allowed=conclusion_allowed(answer_number, state), candidate_name=user_meta.get("name"))
+            try:
+                outcome = generate_interviewer_turn(turn_ctx, generate_chat_response, embed_texts)
+            except ProviderUnavailableError as e:
+                # Nothing is invented. Withdraw this turn's answer so the transcript and the answer count are
+                # exactly as before the request, and let the candidate resend once a provider is back. The stored
+                # interview state was never touched.
+                print(f"Chat turn aborted for {payload.interview_id}, no LLM provider available: {e}")
+                cursor.execute("DELETE FROM messages WHERE id = ?", (candidate_message_id,))
+                conn.commit()
+                conn.close()
+                raise HTTPException(status_code=503, detail=PROVIDER_UNAVAILABLE_DETAIL)
+
+            if outcome.action == "conclude":
+                # The model asked to end early (allowed only after a minimum number of answers/topics).
+                next_question, is_completed = CONCLUSION_MESSAGE, True
+                new_state_json = dump_state(state)
+                trace_reason = "interview concluded by the interviewer; closing message"
             else:
-                trace_retrieval = retrieval
-            used_chunk = trace_retrieval.selected if trace_retrieval else None
-            new_state_json = dump_state(record_question(state, plan, outcome.topic, used_chunk.chunk_id if used_chunk else None,
-                                                        preamble=outcome.preamble))
+                next_question = outcome.question
+                if outcome.generation == "fallback":
+                    trace_reason = "deterministic fallback question; retrieved material was not used"
+                else:
+                    trace_retrieval = retrieval
+                used_chunk = trace_retrieval.selected if trace_retrieval else None
+                new_state_json = dump_state(record_question(state, plan, outcome.topic, used_chunk.chunk_id if used_chunk else None,
+                                                            preamble=outcome.preamble))
 
     selected_chunk = trace_retrieval.selected if trace_retrieval else None
     # Canned text (resignation) is the system's; a question is attributed to whoever produced it.
@@ -619,7 +632,7 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
     cursor.execute("INSERT INTO messages (interview_id, sender, text_content, rag_source_chunk, rag_trace, llm_provider, llm_model, gen_meta) VALUES (?, 'ai', ?, ?, ?, ?, ?, ?)",
                   (payload.interview_id, next_question, selected_chunk.text if selected_chunk else None,
                    json.dumps(build_rag_trace(trace_retrieval, target_role, reason_override=trace_reason)),
-                   author[0], author[1], json.dumps(outcome.meta(turn_ctx)) if outcome else None))
+                   author[0], author[1], json.dumps(outcome.meta(turn_ctx)) if outcome else (json.dumps(system_meta) if system_meta else None)))
 
     if new_state_json is not None:
         cursor.execute("UPDATE interviews SET interview_state = ? WHERE id = ?", (new_state_json, payload.interview_id))
