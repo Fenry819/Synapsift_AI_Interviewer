@@ -4,7 +4,7 @@
 
 import React, { useRef, useState } from 'react';
 import { ArrowRight, Brain, BarChart3, Check, FileText, Layers, PenLine, Server, Upload, X, AlertCircle } from 'lucide-react';
-import { formatFileSize, isPdfFile } from '../lib/report';
+import { formatFileSize, isResumeFile, RESUME_ACCEPT } from '../lib/report';
 import { MAX_QUESTIONS } from '../lib/interviewProgress';
 
 interface Props {
@@ -38,7 +38,7 @@ export default function SetupScreen(p: Props) {
 
   const accept = (f: File | null | undefined) => {
     if (!f) return;
-    if (!isPdfFile(f)) { setFileError('Please choose a PDF file.'); return; }
+    if (!isResumeFile(f)) { setFileError('Please choose a PDF or a plain-text (.txt) file.'); return; }
     setFileError('');
     p.setFile(f);
   };
@@ -114,11 +114,11 @@ export default function SetupScreen(p: Props) {
               onDrop={(e) => { e.preventDefault(); setDragging(false); accept(e.dataTransfer.files?.[0]); }}
               className={`group relative flex flex-col items-center justify-center gap-3 rounded-2xl border border-dashed px-6 py-10 text-center transition-all duration-300 has-[:focus-visible]:ring-2 has-[:focus-visible]:ring-indigo-400/70 ${dragging ? 'scale-[1.01] border-indigo-300/80 bg-indigo-400/[0.1] shadow-[0_0_40px_-12px_rgba(99,102,241,0.8)]' : 'border-white/15 bg-white/[0.02] hover:border-indigo-300/50 hover:bg-white/[0.04]'}`}
             >
-              <input ref={inputRef} type="file" accept=".pdf,application/pdf" aria-label="Upload resume (PDF)" onChange={(e) => { accept(e.target.files?.[0]); e.target.value = ''; }} className="absolute inset-0 h-full w-full cursor-pointer opacity-0" />
+              <input ref={inputRef} type="file" accept={RESUME_ACCEPT} aria-label="Upload resume (PDF or .txt)" onChange={(e) => { accept(e.target.files?.[0]); e.target.value = ''; }} className="absolute inset-0 h-full w-full cursor-pointer opacity-0" />
               <span className={`flex h-12 w-12 items-center justify-center rounded-2xl border border-white/10 bg-white/[0.04] text-indigo-300 transition-transform duration-300 ${dragging ? '-translate-y-1 scale-110' : 'group-hover:-translate-y-0.5'}`}><Upload size={20} /></span>
               <span>
                 <span className="block text-[14px] font-medium text-slate-100">{dragging ? 'Drop your resume here' : 'Drag your resume here, or click to browse'}</span>
-                <span className="mt-1 block text-[12.5px] text-slate-500">PDF only. Used to tailor your questions.</span>
+                <span className="mt-1 block text-[12.5px] text-slate-500">PDF or plain text (.txt), up to 5 MB. Used to tailor your questions.</span>
               </span>
             </div>
           ) : (

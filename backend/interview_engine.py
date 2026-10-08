@@ -312,6 +312,20 @@ _GENERIC_STEMS = frozenset(stem(w) for w in sig.GENERIC_FILLER)
 _EVERYDAY_ANCHORS = ["everyday household items, food, animals, clothing, sports and body functions", "a joke about silly everyday things"]
 
 
+def answer_for_retrieval(answer: str, quality: "AnswerQuality | None") -> str | None:
+    """The part of the candidate's last answer that may nudge the knowledge-base query, or None.
+
+    Only an answer that carries real technical substance (judged strong or partial) contributes. Weak, vague, incorrect,
+    irrelevant answers, non-answers, dismissive or abusive replies, requests and appeals never do: their wording is not
+    topical signal and would pull retrieval towards whatever the candidate happened to write ('I like gaming and
+    laptops'). Chatter, appeals and requests inside a substantive answer are stripped first. The role, resume terms and the
+    planned topic always form the query on their own."""
+    if quality is None or quality.label not in ("strong", "partial") or quality.severe_abuse:
+        return None
+    text = sig.strip_markers(answer)
+    return text or None
+
+
 def classify_answer(answer: str, last_question: str | None, topic: str | None,
                     embed_fn: Callable | None = None, profane: bool = False, severe_abuse: bool = False) -> AnswerQuality:
     """Conservative flow classifier. Anything unclear becomes 'partial'; 'incorrect' needs a recognised misconception.

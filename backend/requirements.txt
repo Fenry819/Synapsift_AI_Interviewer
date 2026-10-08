@@ -1,0 +1,39 @@
+# SynapSift AI backend: top-level runtime dependencies only (transitive packages are resolved by pip).
+# Lower bounds are the versions this project was developed and tested with (Python 3.13 / 3.14);
+# upper bounds stop a future major release from breaking a fresh install.
+#
+#   cd backend
+#   python -m venv venv && venv\Scripts\activate        (Windows)   |   source venv/bin/activate   (macOS / Linux)
+#   pip install -r requirements.txt
+
+# --- web API ---
+fastapi>=0.142,<1.0
+uvicorn>=0.54,<1.0
+python-multipart>=0.0.32,<0.1      # required by FastAPI for the resume upload (multipart/form-data)
+pydantic>=2.13,<3
+email-validator>=2.3,<3            # pydantic EmailStr on the sign-up / login models
+
+# --- authentication, configuration, content checks ---
+PyJWT>=2.10,<3
+bcrypt>=5.0,<6
+python-dotenv>=1.2,<2
+better-profanity>=0.7,<0.8
+
+# --- resume parsing and knowledge-base ingestion ---
+PyPDF2>=3.0,<4                     # resume PDFs (request path)
+pypdf>=6.0,<7                      # used by LangChain's PyPDFLoader in ingest.py
+
+# --- LLM providers (OpenRouter, local Ollama over HTTP, Gemini evaluation) ---
+httpx>=0.28,<1.0
+langchain-core>=1.6,<2
+langchain-openai>=1.6,<2
+langchain-google-genai>=4.4,<5
+google-genai>=2.28,<3
+
+# --- RAG: embeddings + embedded Qdrant vector store ---
+langchain-community>=0.4,<0.5
+langchain-text-splitters>=1.1,<2
+langchain-huggingface>=1.2,<2
+langchain-qdrant>=1.1,<2
+qdrant-client>=1.19,<2
+sentence-transformers>=6.1,<7      # downloads the all-MiniLM-L6-v2 embedding model on first use (pulls in PyTorch)

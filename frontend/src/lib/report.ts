@@ -46,6 +46,17 @@ export function isPdfFile(file: { name: string; type?: string }): boolean {
   return file.type === 'application/pdf' || /\.pdf$/i.test(file.name);
 }
 
+export function isTextFile(file: { name: string; type?: string }): boolean {
+  return /\.txt$/i.test(file.name) || file.type === 'text/plain';
+}
+
+/** Resumes may be a PDF or a plain-text (.txt) file. DOCX and everything else is refused. */
+export function isResumeFile(file: { name: string; type?: string }): boolean {
+  return isPdfFile(file) || isTextFile(file);
+}
+
+export const RESUME_ACCEPT = '.pdf,.txt,application/pdf,text/plain';
+
 export function isValidEmail(value: string): boolean {
   return /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(value.trim());
 }

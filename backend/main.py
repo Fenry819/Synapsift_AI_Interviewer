@@ -2,6 +2,8 @@ import os
 import json
 import sqlite3
 import random
+import secrets
+import hmac
 import jwt
 import datetime
 import PyPDF2
@@ -29,13 +31,14 @@ from resume_profile import (
 import rag_config as rag_cfg
 from rag import retrieve_context, build_rag_trace, knowledge_base_status, RetrievalResult
 from llm_providers import generate_chat_response, call_local_llm, ProviderUnavailableError
+from resume_intake import KIND_PDF, ResumeFormatError, detect_resume_kind, extract_text_resume
 from interview_style import CLOSING_MESSAGE, CONDUCT_TERMINATION_MESSAGE, CONDUCT_TERMINATION_REASON
 from answer_signals import is_severe_abuse
 from evaluation import (
     EvaluationUnavailableError, build_transcript, cached_report, evaluate_transcript, terminated_report,
 )
 from interview_engine import (
-    TurnContext, classify_answer, conclusion_allowed, dump_state, fresh_state, generate_interviewer_turn,
+    TurnContext, answer_for_retrieval, classify_answer, conclusion_allowed, dump_state, fresh_state, generate_interviewer_turn,
     history_from_messages, load_state, plan_next_step, record_question,
 )
 
@@ -43,8 +46,15 @@ from interview_engine import (
 load_dotenv()
 PRIMARY_KEY = os.getenv("GEMINI_API_KEY")
 BACKUP_KEY = os.getenv("GEMINI_BACKUP_API_KEY")
-JWT_SECRET = os.getenv("JWT_SECRET", "super_secret_synapsift_key_2026")
 JWT_ALGORITHM = "HS256"
+# Signing key for login tokens. It must come from the environment (.env). If it is missing a random per-process key is
+# used so nothing is ever signed with a published default; sessions then end whenever the server restarts.
+JWT_SECRET = (os.getenv("JWT_SECRET") or "").strip()
+if not JWT_SECRET:
+    JWT_SECRET = secrets.token_urlsafe(48)
+    print("⚠️ JWT_SECRET is not set: using a temporary random key (logins will not survive a restart). Set JWT_SECRET in .env.")
+# Access code required to register an administrator account. Unset = administrator sign-up is disabled.
+ADMIN_SIGNUP_CODE = (os.getenv("ADMIN_SIGNUP_CODE") or "").strip()
 
 # 2. Relational Database Initialization
 def init_relational_db():
@@ -359,8 +369,11 @@ def build_interview_context(target_role: str, candidate_profile: dict, answer_nu
 
 @app.post("/api/auth/signup")
 async def signup(user: SignUpRequest):
-    if user.role == "admin" and user.admin_code != "PGAGI-RECRUITER-2026":
-        raise HTTPException(status_code=403, detail="Invalid or missing Admin Access Code")
+    if user.role == "admin":
+        if not ADMIN_SIGNUP_CODE:
+            raise HTTPException(status_code=403, detail="Administrator sign-up is not enabled on this server")
+        if not hmac.compare_digest((user.admin_code or "").encode("utf-8"), ADMIN_SIGNUP_CODE.encode("utf-8")):
+            raise HTTPException(status_code=403, detail="Invalid or missing Admin Access Code")
     conn = sqlite3.connect("synapsift.db")
     cursor = conn.cursor()
     salt = bcrypt.gensalt()
@@ -403,13 +416,15 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
     # --- Validate everything BEFORE anything is written to disk or the database ---
     role = normalize_role(role)
 
-    pdf_bytes = await resume.read(MAX_RESUME_BYTES + 1)
-    if len(pdf_bytes) > MAX_RESUME_BYTES:
+    resume_bytes = await resume.read(MAX_RESUME_BYTES + 1)
+    if len(resume_bytes) > MAX_RESUME_BYTES:
         raise HTTPException(status_code=413, detail=f"Resume is too large (limit {MAX_RESUME_BYTES // (1024 * 1024)} MB)")
-    if b"%PDF-" not in pdf_bytes[:1024]:
-        raise HTTPException(status_code=415, detail="Only PDF resumes are supported")
-
-    resume_text = extract_resume_text(pdf_bytes)
+    # PDF (PyPDF2) or plain UTF-8 text; anything else (DOCX included) is refused with a clear error.
+    try:
+        resume_kind = detect_resume_kind(resume.filename, resume.content_type, resume_bytes[:1024])
+        resume_text = extract_resume_text(resume_bytes) if resume_kind == KIND_PDF else extract_text_resume(resume_bytes, MIN_RESUME_TEXT_CHARS)
+    except ResumeFormatError as e:
+        raise HTTPException(status_code=e.status, detail=str(e))
 
     # Resume -> structured profile, once. Deterministic, so it cannot invent skills; if it ever
     # fails the interview still proceeds with an empty profile instead of crashing.
@@ -421,7 +436,7 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
     profile_text = profile_to_prompt_text(candidate_profile)
 
     interview_id = "interview_" + os.urandom(4).hex()
-    file_path = f"uploads/{interview_id}.pdf"     # written only after the first question exists (see below)
+    file_path = f"uploads/{interview_id}.{'pdf' if resume_kind == KIND_PDF else 'txt'}"     # written only after the first question exists (see below)
     resume_url = f"http://127.0.0.1:8000/{file_path}"
 
     # === 🛡️ PYTHON DOMAIN GATEKEEPER (Fail-Fast) ===
@@ -456,7 +471,7 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
         first_question = outcome.question
 
     with open(file_path, "wb") as f:
-        f.write(pdf_bytes)
+        f.write(resume_bytes)
 
     # Provenance. Canned rejection text belongs to the system; a question to whoever produced it (a provider,
     # or the backend's deterministic fallback when a provider answered but nothing acceptable came back).
@@ -589,9 +604,9 @@ async def chat_round(payload: ChatPayload, user_meta: dict = Depends(get_current
                            "conduct_consecutive_after_warning": state.conduct_consecutive, "answer_number": answer_number}
         else:
             # Role-aware retrieval from trusted context. Chunks already used in this interview are skipped; the
-            # candidate's answer only nudges the query.
+            # candidate's answer only nudges the query, and only when it was substantive (see answer_for_retrieval).
             retrieval = retrieve_for_interview(
-                target_role, profile, interview_context["progress"]["answer_number"], current_answer=payload.message,
+                target_role, profile, interview_context["progress"]["answer_number"], current_answer=answer_for_retrieval(payload.message, quality),
                 topic_hint=plan.topic, exclude_chunk_ids=set(state.used_chunk_ids))
 
             turn_ctx = TurnContext(

@@ -1,6 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { clampScore, scoreTone, answerTypeLabel, ringGeometry, formatFileSize, isPdfFile, isValidEmail, initials, ANSWER_TYPE_ORDER, sentenceCase } from '../src/lib/report.ts';
+import { clampScore, scoreTone, answerTypeLabel, ringGeometry, formatFileSize, isPdfFile, isValidEmail, initials, ANSWER_TYPE_ORDER, sentenceCase, isTextFile, isResumeFile, RESUME_ACCEPT } from '../src/lib/report.ts';
 import { easeOutCubic, countValue } from '../src/lib/countUp.ts';
 
 test('scores are clamped and rounded; garbage becomes 0', () => {
@@ -61,4 +61,12 @@ test('sentence case touches only the first letter', () => {
   assert.equal(sentenceCase('  ML basics'), 'ML basics');
   assert.equal(sentenceCase(''), '');
   assert.equal(sentenceCase(null), '');
+});
+
+test('resume files: PDF or plain text only (no DOCX)', () => {
+  assert.ok(isResumeFile({ name: 'cv.pdf', type: 'application/pdf' }) && isResumeFile({ name: 'cv.PDF', type: '' }));
+  assert.ok(isResumeFile({ name: 'cv.txt', type: 'text/plain' }) && isResumeFile({ name: 'My CV.TXT', type: '' }) && isTextFile({ name: 'x', type: 'text/plain' }));
+  assert.ok(!isResumeFile({ name: 'cv.docx', type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document' }));
+  assert.ok(!isResumeFile({ name: 'cv.doc', type: 'application/msword' }) && !isResumeFile({ name: 'photo.png', type: 'image/png' }));
+  assert.ok(RESUME_ACCEPT.includes('.txt') && RESUME_ACCEPT.includes('.pdf') && !/docx?/.test(RESUME_ACCEPT));
 });
