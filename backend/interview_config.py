@@ -35,7 +35,7 @@ NON_ANSWER_MAX_REMAINDER_WORDS = 2  # ...and only if at most this many meaningfu
 IRRELEVANT_MAX_WORDS = 15           # only short replies can be called irrelevant
 # Measured: nonsense replies ("pink pong shoot a gun", "banana pizza dinosaur", ...) score -0.04..0.10 against the
 # question; short genuine answers ("add a penalty term", "use dropout", ...) score 0.12..0.50.
-IRRELEVANT_MAX_SIMILARITY = 0.11    # answer<->question cosine similarity below this (and no shared terms)
+IRRELEVANT_MAX_SIMILARITY = 0.18    # best of answer<->question / answer<->topic cosine similarity below this (and no shared terms)
 STRONG_MIN_WORDS = 35
 STRONG_MIN_RELEVANT_TERMS = 4
 STRONG_MIN_SPECIFIC_TERMS = 3       # a long answer made of filler / the question's own words is not 'strong'

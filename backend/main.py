@@ -15,6 +15,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, EmailStr
 from dotenv import load_dotenv
 from langchain_google_genai import ChatGoogleGenerativeAI
+from google.genai.types import AutomaticFunctionCallingConfig
 from langchain_core.messages import HumanMessage
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_qdrant import QdrantVectorStore 
@@ -29,6 +30,9 @@ import rag_config as rag_cfg
 from rag import retrieve_context, build_rag_trace, knowledge_base_status, RetrievalResult
 from llm_providers import generate_chat_response, call_local_llm, ProviderUnavailableError
 from interview_style import CLOSING_MESSAGE
+from evaluation import (
+    EvaluationUnavailableError, build_transcript, cached_report, evaluate_transcript, terminated_report,
+)
 from interview_engine import (
     TurnContext, classify_answer, conclusion_allowed, dump_state, fresh_state, generate_interviewer_turn,
     history_from_messages, load_state, plan_next_step, record_question,
@@ -119,16 +123,14 @@ def init_relational_db():
 
 init_relational_db()
 
-# Raised when an evaluation could not be produced (provider outage / unusable output).
-class EvaluationUnavailableError(Exception):
-    pass
-
 # 3. AI engines
 # Interviewer chat (OpenRouter -> local Ollama model) lives in llm_providers.generate_chat_response and
 # raises ProviderUnavailableError when no provider answers; it never fabricates a question.
 # Evaluation: Gemini (primary key, then backup key), then the same local Ollama model.
 def generate_eval_response(messages: list) -> str:
     gemini_model = "gemini-3.5-flash"
+    # Evaluation uses no tools, so automatic function calling is switched off explicitly (it also silences the SDK's AFC warning).
+    no_afc = {"automatic_function_calling": AutomaticFunctionCallingConfig(disable=True)}
 
     def extract_text(content):
         if isinstance(content, list):
@@ -139,14 +141,14 @@ def generate_eval_response(messages: list) -> str:
     try:
         print(f"🧠 Querying {gemini_model} API for Evaluation...")
         llm = ChatGoogleGenerativeAI(model=gemini_model, google_api_key=PRIMARY_KEY)
-        response = llm.invoke(messages)
+        response = llm.invoke(messages, **no_afc)
         return extract_text(response.content)
     except Exception as e_primary:
         print(f"⚠️ Primary Gemini failed: {e_primary}. Transitioning to Backup Key...")
         try:
             if BACKUP_KEY:
                 llm_backup = ChatGoogleGenerativeAI(model=gemini_model, google_api_key=BACKUP_KEY)
-                backup_response = llm_backup.invoke(messages)
+                backup_response = llm_backup.invoke(messages, **no_afc)
                 return extract_text(backup_response.content)
         except Exception as e_backup:
             print(f"⚠️ Backup Gemini failed: {e_backup}. Falling back to the local model...")
@@ -436,7 +438,7 @@ async def start_interview(role: str = Form(...), resume: UploadFile = File(...),
     else:
         initial_status = "ONGOING"
         domain = rag_cfg.resolve_domain(role)
-        state, plan = plan_next_step(state, None, domain)
+        state, plan = plan_next_step(state, None, domain, profile=candidate_profile, seed=interview_id)
         # Role-aware retrieval for the FIRST question: query = topic to cover + role + the profile terms that
         # belong to the domain. Roles without a corpus get no retrieval and no substitute material.
         retrieval = retrieve_for_interview(role, candidate_profile, answer_number=0, topic_hint=plan.topic)
@@ -645,139 +647,44 @@ async def fetch_session_summary(interview_id: str, user_meta: dict = Depends(get
         raise HTTPException(status_code=403, detail="You do not have access to this interview")
     row = (interview_row[1], interview_row[2])
 
-    # 1. CHECK CACHE FIRST
-    cached_json = None
-    if row[0]:
-        try:
-            cached_json = json.loads(row[0])
-        except ValueError:
-            cached_json = None
-        # Ignore bogus results written by earlier versions (provider failure saved as a score of 0).
-        if not (isinstance(cached_json, dict) and "overallScore" in cached_json and "summary" in cached_json
-                and cached_json.get("summary") != "Evaluation failed to parse."):
-            cached_json = None
-
+    # 1. CHECK CACHE FIRST. Only a valid report of the CURRENT schema version is served; anything older (or
+    # malformed) is recomputed, and a failed recomputation leaves the stored row untouched.
+    cached_json = cached_report(row[0]) if row[0] else None
     if cached_json is not None:
         cached_json["resume_url"] = row[1]
         conn.close()
         return cached_json
 
-    # 2. GENERATE WITH GEMINI
-    cursor.execute("SELECT sender, text_content FROM messages WHERE interview_id = ? ORDER BY id ASC", (interview_id,))
+    # 2. BUILD THE TRANSCRIPT: only real question -> answer pairs (never greetings, closings, rejections, resignations)
+    cursor.execute("SELECT sender, text_content, llm_provider, gen_meta FROM messages WHERE interview_id = ? ORDER BY id ASC", (interview_id,))
     rows = cursor.fetchall()
-    
+
     if not rows:
         conn.close()
         raise HTTPException(status_code=404, detail="Requested screening logs could not be located")
-        
-    qa_pairs = []
-    current_question = None
-    
-    for sender, text in rows:
-        if sender == 'ai':
-            current_question = text
-        elif sender == 'candidate' and current_question:
-            qa_pairs.append({"question": current_question, "answer": text})
-            current_question = None
+
+    transcript = build_transcript(rows)
 
     # === 🛑 TOKEN SAVER: BYPASS LLM FOR TERMINATIONS & REJECTIONS ===
-    # Look at the final message the AI sent
-    last_ai_msg = next((text for sender, text in reversed(rows) if sender == 'ai'), "")
-    
-    # If the transcript is empty (Domain Reject) or contains our termination strings
-    is_rejected = len(qa_pairs) == 0
-    is_terminated = "session is closed" in last_ai_msg or "unwilling to proceed" in last_ai_msg or "unable to conduct" in last_ai_msg
+    if transcript.rejected or transcript.terminated:
+        report = terminated_report(transcript)
+    else:
+        # 3. EVALUATE. Provider outages and unusable output are NOT candidate results: nothing is saved, the
+        # client gets a 503, and the evaluation can simply be requested again.
+        try:
+            report = evaluate_transcript(transcript, lambda prompt: generate_eval_response([HumanMessage(content=prompt)]))
+        except EvaluationUnavailableError as e:
+            print(f"Evaluation unavailable, nothing saved: {e}")
+            conn.close()
+            raise HTTPException(status_code=503, detail="Evaluation is temporarily unavailable. Please try again in a moment.")
 
-    if is_rejected or is_terminated:
-        parsed_json = {
-            "overallScore": 0,
-            "summary": "Interview terminated early due to domain rejection, resignation, or policy violation.",
-            "insights": "Automated failure. The LLM evaluation phase was bypassed to conserve system resources.",
-            "breakdown": [
-                {
-                    "question": qa["question"],
-                    "answer": qa["answer"],
-                    "score": 0,
-                    "feedback": "Score voided due to early termination."
-                } for qa in qa_pairs
-            ]
-        }
-        
-        # Save bypass result directly to database
-        json_str = json.dumps(parsed_json)
-        cursor.execute("UPDATE interviews SET overall_score = 0, evaluation_summary = ?, evaluation_data = ?, status = 'COMPLETED' WHERE id = ?", 
-                      (parsed_json["summary"], json_str, interview_id))
-        conn.commit()
-        
-        parsed_json["resume_url"] = row[1] if row else None
-        conn.close()
-        return parsed_json
-
-    # --- COMPLETE TRANSCRIPT EVALUATION ---
-    verification_payload = json.dumps(qa_pairs, indent=2)
-    
-    prompt = HumanMessage(
-        content=f"""Analyze this COMPLETE technical interview transcript:
-        {verification_payload}
-        
-        Evaluate the candidate and output ONLY a valid JSON object matching this exact structure. 
-        CRITICAL RULES:
-        1. You must evaluate EVERY question. Output EXACTLY {len(qa_pairs)} items in the "breakdown" array. Do not skip any.
-        2. RUTHLESS SCORING: If the candidate answers "I don't know", "no", "uhh", gives gibberish, or uses slang, the score for that question MUST BE EXACTLY 0.
-        3. The "overallScore" must be the true mathematical average of all {len(qa_pairs)} individual question scores.
-        
-        {{
-            "overallScore": 85,
-            "summary": "2 sentence overall summary.",
-            "insights": "Strengths: X. Weaknesses: Y.",
-            "breakdown": [
-                {{
-                    "question": "The question asked",
-                    "answer": "The candidate's answer",
-                    "score": 0,
-                    "feedback": "1 sentence strict feedback explaining the score."
-                }}
-            ]
-        }}"""
-    )
-    # Provider outages and unusable output are NOT candidate results: nothing is saved, the
-    # client gets a 503, and the evaluation can simply be requested again.
-    try:
-        response_text = generate_eval_response([prompt])
-
-        match = re.search(r'\{.*\}', response_text, re.DOTALL)
-        if not match:
-            raise ValueError("No JSON boundaries found.")
-        parsed_json = json.loads(match.group(0))
-
-        breakdown = parsed_json.get("breakdown") if isinstance(parsed_json, dict) else None
-        is_number = lambda v: isinstance(v, (int, float)) and not isinstance(v, bool)
-        if not (is_number(parsed_json.get("overallScore"))
-                and isinstance(breakdown, list) and len(breakdown) == len(qa_pairs)
-                and all(isinstance(b, dict) and is_number(b.get("score")) for b in breakdown)):
-            raise ValueError("Evaluation JSON does not match the expected structure.")
-    except Exception as e:
-        print(f"Evaluation unavailable, nothing saved: {e}")
-        conn.close()
-        raise HTTPException(status_code=503, detail="Evaluation is temporarily unavailable. Please try again in a moment.")
-
-    # === 🛡️ BACKEND STRUCTURAL INTEGRITY OVERRIDE LOOP ===
-    if "breakdown" in parsed_json and isinstance(parsed_json["breakdown"], list):
-        # We ONLY override the text of the questions the AI actually evaluated. 
-        # No unfair padding with 0s!
-        for i in range(min(len(parsed_json["breakdown"]), len(qa_pairs))):
-            parsed_json["breakdown"][i]["question"] = qa_pairs[i]["question"]
-            parsed_json["breakdown"][i]["answer"] = qa_pairs[i]["answer"]
-
-    json_str = json.dumps(parsed_json)
-
-    cursor.execute("UPDATE interviews SET overall_score = ?, evaluation_summary = ?, evaluation_data = ?, status = 'COMPLETED' WHERE id = ?", 
-                  (parsed_json.get("overallScore", 0), parsed_json.get("summary", ""), json_str, interview_id))
+    cursor.execute("UPDATE interviews SET overall_score = ?, evaluation_summary = ?, evaluation_data = ?, status = 'COMPLETED' WHERE id = ?",
+                  (report["overallScore"], report["summary"], json.dumps(report), interview_id))
     conn.commit()
-    
-    parsed_json["resume_url"] = row[1] if row else None
+
+    report["resume_url"] = row[1]
     conn.close()
-    return parsed_json
+    return report
 
 @app.get("/api/admin/candidates")
 async def get_all_candidates(user_meta: dict = Depends(get_current_user)):

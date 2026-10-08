@@ -8,6 +8,7 @@ whether it is acceptable.
 
 Pure logic (no database, no network). Embeddings and the chat provider are injected callables.
 """
+import hashlib
 import json
 import math
 import re
@@ -169,13 +170,31 @@ def _seed_covered(seed: str, asked_topics: list, previous_questions) -> bool:
     return False
 
 
-def pick_next_topic(domain: str | None, asked_topics: list, previous_questions=()) -> str:
-    """First topic seed of the domain that has not been covered yet (generic engineering topics when the role
-    has no corpus). When everything is covered, cycle."""
+def _resume_topic_matches(seeds: list, profile: dict | None) -> list:
+    """Seeds that clearly echo a stated skill ('Deep Learning' -> 'neural networks and deep learning'). Only distinctive
+    words count, so 'Machine Learning' (present in nearly every seed) is not a signal."""
+    skill_stems = set()
+    for skill in (profile or {}).get("skills") or []:
+        skill_stems |= set(content_stems(str(skill)))
+    skill_stems -= _GENERIC_STEMS | {stem("machine"), stem("learning"), stem("model")}
+    return [s for s in seeds if topic_tokens(s) & skill_stems]
+
+
+def pick_next_topic(domain: str | None, asked_topics: list, previous_questions=(), profile: dict | None = None,
+                    seed: str | None = None) -> str:
+    """Next topic seed of the domain that has not been covered yet (generic engineering topics when the role has no corpus).
+    When everything is covered, cycle.
+
+    Opening question only (nothing asked yet) and a `seed` (the interview id) given: instead of always the first seed, choose
+    among the uncovered seeds that echo the resume's skills, else among the foundational first half of the domain's seeds,
+    by a stable hash of the seed. Backend-controlled, varies between interviews, identical for the same interview."""
     seeds = rag_cfg.DOMAIN_INFO[domain]["topic_seeds"] if domain in rag_cfg.DOMAIN_INFO else GENERIC_TOPICS
-    for seed in seeds:
-        if not _seed_covered(seed, asked_topics, previous_questions):
-            return seed
+    open_seeds = [t for t in seeds if not _seed_covered(t, asked_topics, previous_questions)]
+    if seed and not asked_topics and open_seeds:
+        pool = _resume_topic_matches(open_seeds, profile) or open_seeds[:max(2, len(seeds) // 2)]
+        return pool[int(hashlib.sha256(seed.encode("utf-8")).hexdigest(), 16) % len(pool)]
+    if open_seeds:
+        return open_seeds[0]
     return seeds[len(asked_topics) % len(seeds)]
 
 
@@ -330,8 +349,11 @@ def classify_answer(answer: str, last_question: str | None, topic: str | None,
 
     if not relevant and 2 <= len(words) <= cfg.IRRELEVANT_MAX_WORDS and embed_fn is not None:
         try:
-            a_vec, q_vec = embed_fn([text, context_text.strip() or "technical interview question"])
-            sim = cosine(a_vec, q_vec)
+            # Similarity to the question OR to the topic, whichever is closer: a short valid answer is often closer to the
+            # topic than to the question's wording, while off-topic talk (even technology-themed) is far from both.
+            targets = [(last_question or "").strip() or "technical interview question"] + ([topic] if topic else [])
+            a_vec, *t_vecs = embed_fn([text] + targets)
+            sim = max(cosine(a_vec, v) for v in t_vecs)
             signals["similarity_to_question"] = round(sim, 3)
             if sim < cfg.IRRELEVANT_MAX_SIMILARITY:
                 return result("irrelevant", "no shared technical terms and semantically unrelated to the question")
@@ -386,7 +408,7 @@ def _wants_depth_probe(s: InterviewState, answer_number: int, max_answers: int) 
 
 
 def plan_next_step(state: InterviewState, quality: AnswerQuality | None, domain: str | None, previous_questions=(),
-                   answer_number: int = 0, max_answers: int = 10):
+                   answer_number: int = 0, max_answers: int = 10, profile: dict | None = None, seed: str | None = None):
     """Apply the judged answer to the state and decide what the next question must be.
     Returns (state after the answer, StepPlan). The state is NOT yet updated with the next question.
 
@@ -397,7 +419,7 @@ def plan_next_step(state: InterviewState, quality: AnswerQuality | None, domain:
       irrelevant / dismissive  -> ONE firm redirect (re-ask) on the same topic; if it repeats -> new topic"""
     s = state.model_copy(deep=True)
     if quality is None:                                   # the very first question
-        return s, StepPlan("open", s.difficulty, pick_next_topic(domain, s.asked_topics, previous_questions), None)
+        return s, StepPlan("open", s.difficulty, pick_next_topic(domain, s.asked_topics, previous_questions, profile, seed), None)
 
     label, behavior = quality.label, quality.behavior
     poor = label in style.POOR_LABELS

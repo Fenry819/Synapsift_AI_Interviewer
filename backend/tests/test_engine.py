@@ -48,6 +48,32 @@ check("initial difficulty: no signals -> beginner (not senior)", ie.initial_diff
 check("initial difficulty: masters + work experience -> intermediate", ie.initial_difficulty({"experience_signals": {"highest_education": "masters", "has_work_experience": True}}) == "intermediate")
 check("persona never raises difficulty (no resume signal -> still beginner)", ie.fresh_state(EMPTY).difficulty == "beginner")
 
+print("== opening topic selection ==")
+import rag_config as _rc
+SEEDS = _rc.DOMAIN_INFO["ai_ml"]["topic_seeds"]
+ids = [f"interview_{i:08x}" for i in range(0x1000, 0x1000 + 40)]
+EMPTY = {"skills": [], "technologies": [], "domains": []}
+opens = {i: ie.plan_next_step(ie.fresh_state(EMPTY), None, "ai_ml", profile=EMPTY, seed=i)[1] for i in ids}
+firsts = {p.topic for p in opens.values()}
+check("40 different AI/ML interviews start on several different topics (not always the first seed)", len(firsts) >= 3 and len(firsts) > 1, firsts)
+check("every opening topic is a trusted foundational seed from the domain (first half of the taxonomy)", firsts <= set(SEEDS[:4]), firsts)
+check("the first taxonomy seed is not the only/automatic choice", firsts != {SEEDS[0]})
+check("same interview seed -> same opening topic every time (reproducible)", all(ie.plan_next_step(ie.fresh_state(EMPTY), None, "ai_ml", profile=EMPTY, seed=i)[1].topic == opens[i].topic for i in ids))
+check("opening step and difficulty rules are unchanged (step 'open', difficulty from the profile)", all(p.step == "open" and p.difficulty == ie.fresh_state(EMPTY).difficulty for p in opens.values()))
+DL = {"skills": ["Deep Learning", "Machine Learning"], "technologies": ["PyTorch"], "domains": ["deep learning"]}
+check("clear resume signal (Deep Learning) -> opens on the matching seed for every interview",
+      {ie.plan_next_step(ie.fresh_state(DL), None, "ai_ml", profile=DL, seed=i)[1].topic for i in ids} == {"neural networks and deep learning"})
+CL = {"skills": ["Clustering", "Dimensionality Reduction", "Machine Learning"], "technologies": [], "domains": []}
+check("another signal (Clustering) -> opens on the unsupervised-learning seed", {ie.plan_next_step(ie.fresh_state(CL), None, "ai_ml", profile=CL, seed=i)[1].topic for i in ids} == {"unsupervised learning and clustering"})
+check("only generic 'Machine Learning' is NOT a resume signal (still varies)", len({ie.plan_next_step(ie.fresh_state(EMPTY), None, "ai_ml", profile={"skills": ["Machine Learning"]}, seed=i)[1].topic for i in ids}) >= 3)
+check("no seed given -> legacy behaviour (first uncovered seed), so existing callers are unaffected", ie.plan_next_step(ie.fresh_state(EMPTY), None, "ai_ml")[1].topic == SEEDS[0])
+check("a covered seed is never chosen for the opening (topic deduplication still applies)",
+      all(ie.pick_next_topic("ai_ml", [], ["Can you explain how neural networks and deep learning work?"], DL, i) != "neural networks and deep learning" for i in ids))
+check("later topics are untouched: with topics already asked the next seed is still the first uncovered one",
+      ie.pick_next_topic("ai_ml", [SEEDS[0]], [], EMPTY, "interview_x") == SEEDS[1])
+check("domains without a corpus still get a generic topic (no AI/ML seed leaks in)", ie.pick_next_topic(None, [], [], EMPTY, "interview_x") in ie.GENERIC_TOPICS)
+check("data-science domain also varies and stays inside its own seeds", {ie.pick_next_topic("data_science", [], [], EMPTY, i) for i in ids} <= set(_rc.DOMAIN_INFO["data_science"]["topic_seeds"]) and len({ie.pick_next_topic("data_science", [], [], EMPTY, i) for i in ids}) >= 2)
+
 # ============================ answer quality (real embeddings) ============================
 print("== answer quality ==")
 Q = "What is overfitting and how do you prevent it?"; T = "overfitting and regularization"
@@ -70,6 +96,21 @@ for ans in ["add a penalty term", "Use dropout", "It memorises the noise", "earl
 got = cq("Not sure, but I think it memorises the training noise and then fails to generalise to unseen data, so regularization and more data should help")
 check("'Not sure, but <real explanation>' keeps its substance (not a non-answer)", got.label in ("partial", "strong"), got)
 check("'I would pass the data through the pipeline' is not treated as the word 'pass'", "non-answer" not in cq("I would pass the data through the pipeline").reason)
+QF = "What is the purpose of feature engineering in machine learning?"; TF = "feature engineering"
+def cf(ans): return ie.classify_answer(ans, QF, TF, embed)
+for ans in ["I like gaming and laptops a lot, especially comparing hardware and graphics settings.",
+            "The new graphics card has better GPU performance for gaming laptops.",
+            "My phone battery and camera are better than my friend's tablet this year."]:
+    check(f"technology-themed but unrelated {ans[:44]!r} -> irrelevant", cf(ans).label == "irrelevant", cf(ans))
+for ans in ["I enjoy cooking pasta on weekends.", "I watched a football match yesterday with my brother.", "My favourite holiday was the beach trip last summer."]:
+    check(f"ordinary unrelated {ans[:44]!r} -> irrelevant", cf(ans).label == "irrelevant", cf(ans))
+for ans in ["creating better inputs from raw information", "turning raw columns into useful signals", "to create better features", "to make the inputs easier for algorithms to use"]:
+    check(f"short valid answer {ans!r} is NOT irrelevant", cf(ans).label != "irrelevant", cf(ans))
+check("short valid answer on a decision-tree question (no technical vocabulary) is NOT irrelevant",
+      all(ie.classify_answer(a, "How does a decision tree split the data?", "decision trees", embed).label != "irrelevant"
+          for a in ["by asking yes or no questions about the inputs", "choosing the best question at every branch"]))
+check("irrelevant plan stays the professional redirect for that gaming answer",
+      ie.plan_next_step(ie.InterviewState(current_topic=TF, asked_topics=[TF]), cf("I like gaming and laptops a lot, especially comparing hardware and graphics settings."), "ai_ml")[1].step == "redirect")
 check("no embeddings available -> never 'irrelevant' (conservative)", ie.classify_answer("pink pong shoot a gun", Q, T, None).label == "weak")
 bad_embed = lambda texts: (_ for _ in ()).throw(RuntimeError("boom"))
 check("embedding failure -> conservative, no crash", ie.classify_answer("pink pong shoot a gun", Q, T, bad_embed).label in ("weak", "partial"))
