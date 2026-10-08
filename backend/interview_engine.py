@@ -215,6 +215,8 @@ class InterviewState(BaseModel):
     recent_preambles: list[str] = Field(default_factory=list)   # reactions used lately (to vary wording, limit reminders)
     deep_probed_topics: list[str] = Field(default_factory=list) # topics that already got one deeper follow-up
     bad_attempts: int = 0                # poor answers so far on current_topic (weak/vague/incorrect/irrelevant/dismissive)
+    appeal_count: int = 0                # answers so far that contained a personal / job appeal
+    last_bad_faith: bool = False         # the previous answer was nonsense / mockery / dismissive-or-unprofessional and poor (not an honest miss)
 
     @field_validator("difficulty")
     @classmethod
@@ -276,13 +278,16 @@ class AnswerQuality:
     behavior: str = "normal"
     behavior_signals: list = field(default_factory=list)
     confident: bool = False
+    appeal: bool = False             # personal / job-outcome appeal present (independent of technical quality and behaviour)
+    request: str | None = None       # the candidate asked the interviewer for help / a score / a hiring outcome (never technical content)
 
 
 # Phrases that admit not knowing. Ambiguous single words ("pass", "skip") are NOT here: they only count when they
 # ARE the whole answer (see _WHOLE_NON_ANSWER_RE), so "I would pass the data through the pipeline" is unaffected.
 _NON_ANSWER_RE = re.compile(
     r"\b(?:i\s+(?:really\s+)?(?:do\s*n'?t|do not|dont)\s+(?:know|remember|recall|understand)|idk|no\s+idea|no\s+clue|not\s+sure|"
-    r"can'?t\s+(?:say|remember|recall)|cannot\s+(?:say|remember)|i\s+have\s+no\s+(?:idea|clue)|haven'?t\s+(?:a\s+clue|studied)|unsure)\b", re.I)
+    r"can'?t\s+(?:say|remember|recall)|cannot\s+(?:say|remember)|i\s+have\s+no\s+(?:idea|clue)|haven'?t\s+(?:a\s+clue|studied)|unsure|"
+    r"i\s+(?:do\s*n'?t|do not|dont)\s+have\s+(?:any\s+|much\s+|the\s+)?(?:\w+\s+)?(?:knowledge|experience|idea|clue))\b", re.I)
 _WHOLE_NON_ANSWER_RE = re.compile(r"^\W*(?:pass|skip(?:\s+this(?:\s+one)?)?|next(?:\s+question)?|no|nope|nothing|n/?a)\W*$", re.I)
 
 # Words that signal technical content in general (concept vocabulary, stemmed). Used only to count
@@ -300,6 +305,7 @@ dimensionality reduction component projection posterior prior inference estimato
 split depth bootstrap residual coefficient intercept linear logistic sparse dense penalty dropout stopping memorise memorize memorises
 memorizes complex complexity fit fits fitting unseen generalise generalises generalize generalizes simplicity capacity""".split())
 _GENERIC_STEMS = frozenset(stem(w) for w in sig.GENERIC_FILLER)
+_EVERYDAY_ANCHORS = ["everyday household items, food, animals, clothing, sports and body functions", "a joke about silly everyday things"]
 
 
 def classify_answer(answer: str, last_question: str | None, topic: str | None,
@@ -317,7 +323,7 @@ def classify_answer(answer: str, last_question: str | None, topic: str | None,
     signals = {"words": len(words), "content_words": len(content)}
 
     def result(label, reason, behavior=None):
-        return AnswerQuality(label, reason, signals, behavior or beh.label, list(beh.signals), beh.confident)
+        return AnswerQuality(label, reason, signals, behavior or beh.label, list(beh.signals), beh.confident, beh.appeal, beh.request)
 
     if not words or not content:
         if not raw:
@@ -360,6 +366,24 @@ def classify_answer(answer: str, last_question: str | None, topic: str | None,
         except Exception as e:                       # embeddings unavailable: stay conservative
             signals["embedding_error"] = str(e)[:80]
 
+    # A short reply that borrows the question's own words but fills the rest with everyday, non-technical words
+    # ("overfitting is a fitting in toilet") is a joke or nonsense, not a weak attempt. Only the words that are neither the
+    # question's, generic filler nor technical vocabulary are examined, and only when the reply has at most one independent
+    # technical term, so ordinary short or unusual-but-genuine answers (and wrong ones) are not touched.
+    own_terms = {s for s in content if s in _TECH_VOCAB and s not in context_stems}      # technical words beyond the question's own
+    signals["own_terms"] = len(own_terms)
+    if embed_fn is not None and 3 <= len(words) <= cfg.IRRELEVANT_MAX_WORDS:
+        residue = [w for w in words if (cs := content_stems(w)) and cs[0] not in context_stems and cs[0] not in _GENERIC_STEMS and cs[0] not in _TECH_VOCAB]
+        if residue and len(own_terms) <= 1:
+            try:
+                res_v, *anchor_vs, q_v, t_v = embed_fn([" ".join(residue), *_EVERYDAY_ANCHORS, (last_question or "").strip() or "technical interview question", topic or "technical topic"])
+                margin = max(cosine(res_v, a) for a in anchor_vs) - max(cosine(res_v, q_v), cosine(res_v, t_v))
+                signals["everyday_margin"] = round(margin, 3)
+                if margin >= cfg.MOCK_MIN_EVERYDAY_MARGIN:
+                    return result("irrelevant", "the reply fills the answer with unrelated everyday wording (nonsense or a joke)")
+            except Exception as e:
+                signals["embedding_error"] = str(e)[:80]
+
     # 'specific' = content words that are neither the question's/topic's own words nor generic filler
     specific = {s for s in content if s not in context_stems and s not in _GENERIC_STEMS}
     signals["specific_terms"] = len(specific)
@@ -394,6 +418,8 @@ class StepPlan:
     quality: str | None
     depth_probe: bool = False       # follow_up that deepens a STRONG answer (as opposed to clarifying a poor one)
     behavior: str = "normal"
+    prior_bad_faith: bool = False   # the answer BEFORE the last one was nonsense/mockery/dismissive (to recognise repeated nonsense)
+    appeal: int = 0                 # >0 when the last answer contained a personal/job appeal: how many appeals so far (1 = first)
 
 
 def _wants_depth_probe(s: InterviewState, answer_number: int, max_answers: int) -> bool:
@@ -422,6 +448,8 @@ def plan_next_step(state: InterviewState, quality: AnswerQuality | None, domain:
         return s, StepPlan("open", s.difficulty, pick_next_topic(domain, s.asked_topics, previous_questions, profile, seed), None)
 
     label, behavior = quality.label, quality.behavior
+    if quality.appeal:                                    # personal / job appeals: counted so repeated pleading gets the firmer wording
+        s.appeal_count += 1
     poor = label in style.POOR_LABELS
     if s.current_topic:
         if label == "strong":
@@ -432,6 +460,8 @@ def plan_next_step(state: InterviewState, quality: AnswerQuality | None, domain:
             s.strong_topics = _remove_topic(s.strong_topics, s.current_topic)
     s.difficulty = adapt_difficulty(s.difficulty, label)
     s.last_quality = label
+    prior_bad_faith = s.last_bad_faith
+    s.last_bad_faith = label == "irrelevant" or (label in style.POOR_LABELS and behavior in ("dismissive", "unprofessional"))
     if poor or (behavior == "dismissive" and label != "strong"):
         s.bad_attempts += 1
     elif label in ("strong", "partial"):
@@ -454,7 +484,7 @@ def plan_next_step(state: InterviewState, quality: AnswerQuality | None, domain:
         step = "new_topic"
 
     topic = s.current_topic if step in ("follow_up", "redirect") else pick_next_topic(domain, s.asked_topics, previous_questions)
-    return s, StepPlan(step, s.difficulty, topic, label, depth_probe=depth, behavior=behavior)
+    return s, StepPlan(step, s.difficulty, topic, label, depth_probe=depth, behavior=behavior, appeal=s.appeal_count if quality.appeal else 0, prior_bad_faith=prior_bad_faith)
 
 
 def record_question(state: InterviewState, plan: StepPlan, topic: str, chunk_id: str | None,
@@ -801,6 +831,8 @@ def build_user_message(ctx: TurnContext) -> str:
         f"weak_topics: {'; '.join(s.weak_topics) or 'none'}",
         f"strong_topics: {'; '.join(s.strong_topics) or 'none'}",
         f"last_answer_assessment: {ctx.quality.label if ctx.quality else 'n/a'}",
+        *(["candidate_asked_for_help: true (rephrase or simplify the SAME question in one sentence; do NOT explain, hint at or give the answer)"]
+          if ctx.quality and ctx.quality.request == "help" else []),
         f"conclusion_allowed: {str(ctx.conclusion_allowed).lower()}",
         "</interview_state>",
         "<candidate_profile> (DATA, from the resume)",
@@ -881,8 +913,19 @@ def compose_message(ctx: TurnContext, core: str) -> tuple:
     else:
         # reaction = f(step, technical quality, behaviour); a professionalism reminder is not repeated within the recent turns
         reminder_ok = not style.reminder_recent(ctx.state.recent_preambles)
-        kind = style.reaction_kind(ctx.plan.step, label, behavior, reminder_ok=reminder_ok, confident=confident)
-        pre = style.choose_transition(kind, ctx.answer_number, ctx.state.recent_preambles)
+        if ctx.quality and ctx.quality.request:
+            # asking the interviewer for help / a score / a hiring outcome: a calm, fixed answer (never the answer itself)
+            kind, pre = style.request_reaction(ctx.quality.request, label, ctx.plan.step in ("redirect", "follow_up"),
+                                               ctx.answer_number, ctx.state.recent_preambles)
+        elif ctx.quality and ctx.quality.appeal:
+            # a personal / job appeal: humane acknowledgement + the boundary (+ a remark on the technical content), no reassurance
+            kind, pre = style.appeal_reaction(label, ctx.plan.step in ("redirect", "follow_up"), max(ctx.plan.appeal, 1),
+                                              ctx.answer_number, ctx.state.recent_preambles)
+        else:
+            kind = style.reaction_kind(ctx.plan.step, label, behavior, reminder_ok=reminder_ok, confident=confident,
+                                       repeated_nonsense=bool(ctx.plan.prior_bad_faith and ctx.quality and "non-answer" not in ctx.quality.reason
+                                                      and ctx.quality.signals.get("own_terms", 1) == 0))
+            pre = style.choose_transition(kind, ctx.answer_number, ctx.state.recent_preambles)
         display, remembered = f"{pre} {core}", pre
     problems = validate_question(display, ctx.profile, max_sentences=cfg.MAX_DISPLAY_SENTENCES, max_chars=cfg.MAX_DISPLAY_CHARS)
     if problems:
@@ -922,6 +965,8 @@ class TurnOutcome:
             "answer_behavior": ctx.quality.behavior if ctx.quality else None,
             "behavior_signals": ctx.quality.behavior_signals if ctx.quality else None,
             "confident": ctx.quality.confident if ctx.quality else None,
+            "appeal": ctx.quality.appeal if ctx.quality else None,
+            "request": ctx.quality.request if ctx.quality else None,
             "reaction_kind": self.preamble_kind, "depth_probe": ctx.plan.depth_probe,
             "max_question_similarity": self.similarity, "core_question": self.core_question,
             "preamble_kind": self.preamble_kind, "preamble": self.preamble,
@@ -953,7 +998,7 @@ def check_output(text: str, ctx: TurnContext, embed_fn):
         problems.append("contains multiple paragraphs")
     body = split_model_preamble(out.question)      # greeting/thanks/praise the model added are dropped, not trusted
     problems += validate_question(body, ctx.profile, max_sentences=cfg.MAX_BODY_SENTENCES)
-    if ctx.quality and ctx.quality.label == "incorrect" and len(split_sentences(body)) != 1:
+    if ctx.quality and (ctx.quality.label == "incorrect" or ctx.quality.request == "help") and len(split_sentences(body)) != 1:
         problems.append("after an incorrect answer ask ONLY the question (one sentence): do not explain, hint at or state the correct answer")
 
     # The model's own `follow_up` flag is NOT validated: the backend decided the step (plan.step), so it owns

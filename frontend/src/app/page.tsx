@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useState, useEffect, useRef } from 'react';
+import { startReveal } from '../lib/reveal';
 import { Upload, Briefcase, Play, Send, CheckCircle, AlertCircle, RefreshCw, Network, Lock, User, LogOut, Users, FileText, Trash2, UserX, FileBadge } from 'lucide-react';
 
 type Step = 'AUTH' | 'SETUP' | 'INTERVIEW' | 'SUMMARY' | 'ADMIN';
@@ -59,6 +60,49 @@ export default function SynapSiftScreener() {
 
   const textareaRef = useRef<HTMLTextAreaElement>(null);
 
+  // --- Interviewer reply reveal (presentation only: the backend has already validated the full text) ---
+  const [revealing, setRevealing] = useState<{ id: string; shown: string } | null>(null);
+  const cancelRevealRef = useRef<(() => void) | null>(null);
+  const busyRef = useRef<boolean>(false);   // true from the moment a request starts until the reply is fully revealed (blocks double submits)
+  const epochRef = useRef<number>(0);       // bumped whenever the session is left; late responses from an old session are dropped
+  const inputLocked = isAiThinking || revealing !== null;
+
+  const cancelPending = () => {
+    epochRef.current += 1;
+    cancelRevealRef.current?.();
+    cancelRevealRef.current = null;
+    busyRef.current = false;
+    setRevealing(null);
+    setIsAiThinking(false);
+  };
+
+  // Show a NEW interviewer message progressively. Messages already in the list are never animated.
+  const appendInterviewerMessage = (text: string, onDone: () => void) => {
+    const msg: Message = { id: `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`, sender: 'ai', text, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) };
+    setMessages((prev) => [...prev, msg]);
+    setIsAiThinking(false);
+    const instant = typeof window !== 'undefined' && !!window.matchMedia?.('(prefers-reduced-motion: reduce)').matches;
+    cancelRevealRef.current = startReveal(
+      text,
+      (shown) => setRevealing({ id: msg.id, shown }),
+      () => {
+        cancelRevealRef.current = null;
+        setRevealing(null);
+        busyRef.current = false;
+        onDone();
+      },
+      { instant },
+    );
+  };
+
+  useEffect(() => {
+    return () => { epochRef.current += 1; cancelRevealRef.current?.(); };   // unmount: stop timers, ignore late responses
+  }, []);
+
+  useEffect(() => {
+    if (!inputLocked && currentStep === 'INTERVIEW' && !isInterviewComplete) textareaRef.current?.focus();
+  }, [inputLocked, currentStep, isInterviewComplete]);
+
   useEffect(() => {
     const token = localStorage.getItem("synapsift_token");
     const name = localStorage.getItem("synapsift_name");
@@ -84,6 +128,7 @@ export default function SynapSiftScreener() {
   };
 
   const handleLogOut = () => {
+    cancelPending();
     localStorage.clear();
     setUserToken(null);
     setUserName('');
@@ -137,6 +182,7 @@ export default function SynapSiftScreener() {
           return alert(getErrorMessage(data, "Could not abort the session. Please try again."));
         }
       }
+      cancelPending();
       setUploadedFile(null);
       setMessages([]);
       setInterviewId(null);
@@ -206,6 +252,10 @@ export default function SynapSiftScreener() {
     if (!uploadedFile || !userToken) return alert("Please upload a resume file.");
     if (selectedRole === 'Custom Role' && !customRole.trim()) return alert("Please enter a custom role.");
     
+    if (busyRef.current) return;
+    cancelPending();
+    busyRef.current = true;
+    const epoch = epochRef.current;
     setAnalysisReport({ overallScore: 0, summary: "Analyzing session data...", insights: "", breakdown: [] });
     setMessages([]); 
     setCurrentStep('INTERVIEW');
@@ -222,31 +272,33 @@ export default function SynapSiftScreener() {
         body: formData,
       });
       const data = await response.json().catch(() => null);
+      if (epoch !== epochRef.current) return;     // the session was left while this request was running
       if (!response.ok || !data?.interview_id) {
         alert(getErrorMessage(data, "Could not start the interview. Please try again."));
         setInterviewId(null);
         setMessages([]);
         setCurrentStep('SETUP');
+        busyRef.current = false;
+        setIsAiThinking(false);
         return;
       }
       setInterviewId(data.interview_id);
-      setMessages([{ id: Date.now().toString(), sender: 'ai', text: data.first_question, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
-      
-      // === 🛑 THE UI LOCK GUARDRAIL ===
-      // If the backend instantly rejects the role, lock the chat box!
-      if (data.status === 'COMPLETED') {
-        setIsInterviewComplete(true); 
-      }
-
+      // The first question is revealed progressively too; the completion lock below applies once it is fully shown.
+      appendInterviewerMessage(data.first_question, () => {
+        if (data.status === 'COMPLETED') setIsInterviewComplete(true);
+      });
     } catch (error) {
+      if (epoch !== epochRef.current) return;
       console.error(error);
-    } finally {
+      busyRef.current = false;
       setIsAiThinking(false);
     }
   };
 
   const handleSendAnswer = async () => {
-    if (!inputAnswer.trim() || !interviewId || !userToken) return;
+    if (busyRef.current || !inputAnswer.trim() || !interviewId || !userToken) return;   // one request / reveal at a time
+    busyRef.current = true;
+    const epoch = epochRef.current;
 
     const candidateMsg: Message = { id: Date.now().toString(), sender: 'candidate', text: inputAnswer, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) };
     setMessages((prev) => [...prev, candidateMsg]);
@@ -258,6 +310,14 @@ export default function SynapSiftScreener() {
     
     setIsAiThinking(true);
 
+    // The answer was not accepted: take it out of the chat, give it back to the user and unlock the input.
+    const giveAnswerBack = () => {
+      setMessages((prev) => prev.filter((m) => m.id !== candidateMsg.id));
+      setInputAnswer(candidateMsg.text);
+      busyRef.current = false;
+      setIsAiThinking(false);
+    };
+
     try {
       const response = await fetch('http://127.0.0.1:8000/api/interview/chat', {
         method: 'POST',
@@ -265,25 +325,22 @@ export default function SynapSiftScreener() {
         body: JSON.stringify({ interview_id: interviewId, message: candidateMsg.text, role: selectedRole === 'Custom Role' ? customRole.trim() : selectedRole })
       });
       const data = await response.json().catch(() => null);
+      if (epoch !== epochRef.current) return;     // the session was left while this request was running
       if (!response.ok || typeof data?.reply !== 'string') {
-        // The answer was not accepted: take it out of the chat and give it back to the user.
         alert(getErrorMessage(data, "Your answer could not be sent. Please try again."));
-        setMessages((prev) => prev.filter((m) => m.id !== candidateMsg.id));
-        setInputAnswer(candidateMsg.text);
+        giveAnswerBack();
         return;
       }
 
-      // Add the AI's message to the chat
-      setMessages((prev) => [...prev, { id: (Date.now() + 1).toString(), sender: 'ai', text: data.reply, timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) }]);
-
-      // Check the exact status from the backend to reveal the submit button!
-      if (data.status === 'COMPLETED') {
-        setIsInterviewComplete(true); 
-      }
+      // Show the approved reply progressively; the completion check (submit button) runs once it is fully visible.
+      appendInterviewerMessage(data.reply, () => {
+        if (data.status === 'COMPLETED') setIsInterviewComplete(true);
+      });
     } catch (error) {
+      if (epoch !== epochRef.current) return;
       console.error(error);
-    } finally {
-      setIsAiThinking(false);
+      alert("Could not reach the server. Your answer was not sent; please try again.");
+      giveAnswerBack();
     }
   };
 
@@ -496,13 +553,13 @@ export default function SynapSiftScreener() {
               {messages.map((msg) => (
                 <div key={msg.id} className={`flex flex-col ${msg.sender === 'ai' ? 'items-start' : 'items-end'}`}>
                   <div className={`max-w-[85%] rounded-2xl px-5 py-4 shadow-md whitespace-pre-wrap ${msg.sender === 'ai' ? 'bg-slate-900 border border-slate-800 text-slate-100 rounded-tl-none text-[15px] leading-relaxed font-normal tracking-wide' : 'bg-indigo-600 text-white rounded-tr-none text-[14px] leading-relaxed'}`}>
-                    {msg.text}
+                    {revealing?.id === msg.id ? revealing.shown : msg.text}
                   </div>
                 </div>
               ))}
               {isAiThinking && (
-                <div className="flex items-center gap-2.5 text-xs text-slate-500 font-mono italic pl-2 bg-slate-900/20 py-2 w-max rounded-lg">
-                  <RefreshCw size={12} className="animate-spin text-indigo-400" /> Synchronizing language pipeline models...
+                <div role="status" aria-live="polite" className="flex items-center gap-2.5 text-xs text-slate-500 font-mono italic pl-2 bg-slate-900/20 py-2 w-max rounded-lg">
+                  <RefreshCw size={12} className="animate-spin text-indigo-400" /> Interviewer is preparing the next question...
                 </div>
               )}
             </div>
@@ -518,6 +575,7 @@ export default function SynapSiftScreener() {
                         placeholder="Formulate your technical response..." 
                         value={inputAnswer} 
                         onChange={handleInputResize}
+                        disabled={inputLocked}
                         onKeyDown={(e) => {
                           if (e.key === 'Enter' && !e.shiftKey) {
                             e.preventDefault();
@@ -527,7 +585,7 @@ export default function SynapSiftScreener() {
                         className="flex-1 bg-transparent border-none text-sm text-slate-200 focus:outline-none py-2 resize-none min-h-[40px] max-h-32 overflow-y-auto custom-scrollbar" 
                         rows={1}
                       />
-                      <button onClick={handleSendAnswer} className="p-2 mb-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition"><Send size={14} /></button>
+                      <button onClick={handleSendAnswer} disabled={inputLocked} className="p-2 mb-1 rounded-lg bg-indigo-600 hover:bg-indigo-500 text-white transition disabled:opacity-40 disabled:cursor-not-allowed"><Send size={14} /></button>
                     </div>
                     <div className="flex justify-between items-center px-1">
                       <span className="text-[11px] text-slate-500">Press <strong className="text-slate-400">Enter</strong> to send, <strong className="text-slate-400">Shift + Enter</strong> for new line.</span>
@@ -542,7 +600,7 @@ export default function SynapSiftScreener() {
                     ) ? (
                       <>
                         <p className="text-sm text-red-400 font-medium">Session closed due to domain constraints or policy violation.</p>
-                        <button onClick={() => { setUploadedFile(null); setInterviewId(null); setCurrentStep('SETUP'); }} className="text-sm font-medium bg-slate-800 hover:bg-slate-700 text-white px-6 py-2.5 rounded-lg transition flex items-center gap-2 border border-slate-700">
+                        <button onClick={() => { cancelPending(); setUploadedFile(null); setInterviewId(null); setCurrentStep('SETUP'); }} className="text-sm font-medium bg-slate-800 hover:bg-slate-700 text-white px-6 py-2.5 rounded-lg transition flex items-center gap-2 border border-slate-700">
                           <RefreshCw size={16} /> Return to Setup
                         </button>
                       </>

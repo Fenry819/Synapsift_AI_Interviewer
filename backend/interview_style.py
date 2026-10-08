@@ -98,6 +98,10 @@ TRANSITIONS = {
     "irrelevant_new": ["That doesn't address the question, so let's move on to another topic.",
                        "That's not quite what I asked. Let's try a different area.",
                        "Let's set that aside and move on to another topic."],
+    # ---- nonsense again on the same topic: firm, neutral, then move on (never reassuring)
+    "nonsense_new": ["That still doesn't address the technical question. Let's move to a different area.",
+                     "That's still not addressing the technical question, so let's move to a different area.",
+                     "That still isn't an answer to the question. Let's try a different area."],
     # ---- dismissive: a little firmer, still professional
     "dismissive_follow": ["Please answer the technical question directly.",
                           "I'd like a direct answer to the technical question.",
@@ -125,7 +129,8 @@ def reminder_recent(recent: list) -> bool:
     return any(r in _REMINDER_TEXTS for r in recent)
 
 
-def reaction_kind(step: str, label: str | None, behavior: str, *, reminder_ok: bool = True, confident: bool = False) -> str:
+def reaction_kind(step: str, label: str | None, behavior: str, *, reminder_ok: bool = True, confident: bool = False,
+                  repeated_nonsense: bool = False) -> str:
     """Which family of reactions fits. Priority: dismissive behaviour > a (non-repeated) professionalism reminder for a
     poor answer > the technical quality of the answer. A strong answer is never lectured about wording.
 
@@ -133,7 +138,9 @@ def reaction_kind(step: str, label: str | None, behavior: str, *, reminder_ok: b
     a candidate who claims it is easy and then does not answer must not be told 'no problem'."""
     if step == "open":
         return "open"
-    if label == "weak" and confident:
+    # Reassuring wording ("No problem", "That's fine") is for a good-faith weak answer only: a confident, dismissive or
+    # unprofessional one (even when its professionalism reminder was suppressed this turn) gets the neutral wording.
+    if label == "weak" and (confident or behavior != "normal"):
         label = "vague"
     follow = step in ("redirect", "follow_up")
     if label != "strong":
@@ -141,6 +148,8 @@ def reaction_kind(step: str, label: str | None, behavior: str, *, reminder_ok: b
             return "dismissive_follow" if follow else "dismissive_new"
         if behavior == "unprofessional" and reminder_ok and label in POOR_LABELS:
             return "reminder_follow" if follow else "reminder_new"
+    if repeated_nonsense and label in ("weak", "irrelevant"):
+        return "redirect" if follow else "nonsense_new"    # nonsense again on the same topic: firm and neutral, never reassuring
     if step == "redirect":
         return "redirect"
     if step == "follow_up":
@@ -180,6 +189,93 @@ def choose_transition(kind: str, rotation: int, recent: list) -> str:
         if candidate not in recent:
             return candidate
     return min(options, key=lambda o: recent.index(o) if o in recent else -1)
+
+
+# --- personal / job appeals --------------------------------------------------------------------------------------
+# "Please give me the job, my mom is sick": acknowledge briefly and humanely, state the boundary (only the interview
+# responses are assessed), then carry on. Kept apart from TRANSITIONS because the firmer wording necessarily names
+# 'hiring decisions'. Never a promise, a rejection, a prediction, or any claim of hiring authority; no question mark.
+# Each entry is (acknowledgement + boundary, closing clause); with a technical remark the closing clause is replaced by it.
+APPEAL_FIRST = [
+    ("I understand this is important to you. However, I can only assess you based on your interview responses",
+     "so let's stay focused on the technical discussion."),
+    ("I appreciate you telling me that, and I understand this matters to you. My assessment can only rest on your interview responses",
+     "so let's keep to the technical questions."),
+    ("I hear that this is a difficult situation. All I can do here is assess your interview responses",
+     "so let's stay with the technical discussion."),
+    ("I understand this opportunity matters to you, but I'll need to assess the technical responses themselves",
+     "so let's continue with the technical questions."),
+]
+# Repeated pleading: a little firmer, still kind, still continuing the interview.
+APPEAL_REPEAT = [
+    ("I understand your concern, but hiring decisions can't be based on personal circumstances.", "Please focus on the technical questions."),
+    ("I do understand, but I can't take personal circumstances into account.", "Please focus on the technical questions."),
+    ("I understand how difficult this is, but the assessment can only rest on your technical answers.", "Please keep to the technical questions."),
+]
+# What the answer's technical content earns on top of the boundary: (stays on the topic, moves to another topic).
+_APPEAL_TAIL = {
+    "strong": ("", ""),
+    "partial": ("Your explanation was incomplete, so let's clarify one part.", "Your explanation was incomplete, so let's look at another area."),
+    "vague": ("Your explanation was too vague, so let's clarify it.", "Your explanation was too vague, so let's try a different area."),
+    "incorrect": ("That explanation wasn't accurate, so let's clarify the concept.", "That explanation wasn't accurate, so let's move to another area."),
+    "irrelevant": ("Let's get back to the question itself.", "Let's try a different area."),
+    "weak": ("Let's take it one step at a time.", "Let's try a different area."),
+}
+
+
+# --- requests addressed to the interviewer (help / scores / hiring outcome) --------------------------------------------
+# The interviewer never supplies the technical answer, a score or a hiring outcome. Each entry: (staying on the topic,
+# moving on). No question mark, no technical content, no promise or prediction of any kind.
+REQUEST_REACTIONS = {
+    "request_help": (
+        ["I can't provide the answer during the assessment, but I can rephrase the question.",
+         "I can't give hints or answers during the assessment, but I can put the question another way.",
+         "I'm not able to explain the answer during the assessment, but let me rephrase the question."],
+        ["I can't provide the answer during the assessment, so let's move to another area.",
+         "I can't give hints or answers during the assessment. Let's try a different area."]),
+    "request_score": (
+        ["I can't provide scores during the interview. Let's continue with the assessment.",
+         "I can't share scores or results during the interview. Let's continue with the assessment.",
+         "Scores aren't something I can provide during the interview. Let's continue with the assessment."],
+        ["I can't provide scores during the interview. Let's continue with the assessment in another area.",
+         "I can't share scores or results during the interview. Let's move to another area."]),
+    "request_outcome": (
+        ["I can't comment on hiring outcomes; I can only assess your interview responses. Let's continue with the technical discussion.",
+         "I'm not able to speak to any hiring outcome, and I can only assess your interview responses. Let's continue with the technical discussion.",
+         "That isn't something I can answer; I can only assess your interview responses. Let's continue with the technical discussion."],
+        ["I can't comment on hiring outcomes; I can only assess your interview responses. Let's continue in another area.",
+         "That isn't something I can answer; I can only assess your interview responses. Let's move to another area."]),
+}
+_REQUEST_KIND = {"help": "request_help", "score": "request_score", "outcome": "request_outcome"}
+
+
+def request_reaction(request: str, label: str | None, follow: bool, rotation: int, recent: list) -> tuple:
+    """-> (kind, text) for a candidate request. Rotates through the variants (avoiding the last turns'), and adds the usual
+    neutral remark when the same message also contained a technical answer that was vague, inaccurate or incomplete."""
+    kind = _REQUEST_KIND[request]
+    options = REQUEST_REACTIONS[kind][0 if follow else 1]
+    start = rotation % len(options)
+    ordered = [options[(start + i) % len(options)] for i in range(len(options))]
+    text = next((o for o in ordered if o not in recent), ordered[0])
+    if label in ("vague", "incorrect", "partial"):
+        text += " " + _APPEAL_TAIL[label][0 if follow else 1]
+    return kind, text
+
+
+def appeal_reaction(label: str | None, follow: bool, appeal_count: int, rotation: int, recent: list) -> tuple:
+    """-> (kind, text). First appeal: acknowledge + boundary; any later one: the firmer wording. The boundary sentence
+    rotates and avoids the ones shown in the last turns; the technical remark (if the answer earned one) follows it."""
+    repeat = appeal_count >= 2
+    options = APPEAL_REPEAT if repeat else APPEAL_FIRST
+    start = rotation % len(options)
+    ordered = [options[(start + i) % len(options)] for i in range(len(options))]
+    lead, tail_close = next((o for o in ordered if not any(o[0] in r for r in recent)), ordered[0])
+    tail = _APPEAL_TAIL.get(label or "weak", _APPEAL_TAIL["weak"])[0 if follow else 1]
+    if repeat:
+        text = f"{lead} {tail_close}" + (f" {tail}" if tail else "")
+    else:
+        text = f"{lead}, {tail_close}" if not tail else f"{lead}. {tail}"
+    return ("appeal_repeat" if repeat else "appeal_first"), text
 
 
 # --- closing ----------------------------------------------------------------------------------------------------

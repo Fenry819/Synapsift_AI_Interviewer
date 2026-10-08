@@ -29,9 +29,42 @@ _DISMISSIVE = [
 _CONFIDENT = [
     ("easy_question", r"\b(?:easy|simple|basic|trivial) (?:question|one|stuff)\b|\b(?:too|so|very) easy\b|\bthis is easy\b|\beasy peasy\b|\bpiece of cake\b"),
     ("obviously", r"\bobviously\b|\bduh\b"),
-    ("boasting", r"\b(?:i(?:'m| am)|im) (?:definitely |so |going to |gonna )?(?:get(?:ting)?|got) (?:a|the) job\b|\bhire me\b|"
+    ("boasting", r"\b(?:i(?:'m| am)|im) (?:definitely |so |going to |gonna )?(?:get(?:ting)?|got) (?:a|the) job\b|"
                  r"\bi(?:'m| am) (?:the best|a genius|an expert)\b|\bi know (?:this|everything)\b|\bget(?:ting)? (?:a|the) job\b"),
 ]
+# Personal / job-outcome appeals ("please give me the job", "my mom is sick, I need money"). NOT misconduct and unrelated to
+# technical correctness: tracked as a separate flag so the interviewer can acknowledge it humanely and keep a boundary.
+_NOUN_NEED = r"(?:job|opportunity|chance|money|income|salary|paycheck)"
+_NOUN_GIVE = r"(?:job|position|role|opportunity|chance|offer|selected|selection)"
+_FAMILY = r"(?:mom|mum|mother|dad|father|family|wife|husband|kids?|child|children|parents?|brother|sister|baby|grand\w+)"
+_APPEAL = [
+    ("job_request", rf"\b(?:give|offer|hire|select|pick|choose|take|accept)\s+(?:me|us)\b(?:\s+\w+){{0,2}}?\s+{_NOUN_GIVE}\b"
+                    r"|\bhire\s+me\b|\b(?:select|pick|choose)\s+me\b"),
+    ("need", rf"\b(?:i|we)\s+(?:really\s+|badly\s+|desperately\s+|just\s+|so\s+much\s+)*(?:need|want|require)\s+(?:this|the|a|an|my|some|that)?\s*{_NOUN_NEED}\b"
+             rf"|\b(?:need|needs)\s+(?:the\s+)?(?:money|income|salary|job)\b|\b(?:this|the)\s+(?:job|opportunity)\s+(?:is\s+)?(?:very\s+|really\s+)?(?:important|everything)\b"),
+    ("hardship", rf"\b(?:my|our)\s+{_FAMILY}\b[^.,;!?]{{0,50}}\b(?:sick|ill|unwell|hospital\w*|poor|starv\w+|dying|died|passed away|struggl\w+|depends?|needs?)\b"
+                 r"|\b(?:i(?:'m| am)|im)\s+(?:very\s+|so\s+)?(?:poor|jobless|unemployed|desperate|broke)\b|\bi\s+(?:have|got)\s+no\s+(?:job|money|income)\b"),
+]
+_APPEAL_RE = [(n, re.compile(p, re.I)) for n, p in _APPEAL]
+
+# Requests addressed to the interviewer (meta-interaction, not an answer): help/answers, scores, hiring outcome.
+# Checked in this priority order. They are never technical content.
+_REQUESTS = [
+    ("outcome", r"\b(?:am|will|can|could|do|did|shall)\s+(?:i|we)\s+(?:get(?:ting)?|got)\s+(?:the\s+|this\s+|that\s+|a\s+)?(?:job|position|role|offer|selected|hired|chosen|accepted)\b"
+                r"|\b(?:am|will|shall)\s+(?:i|we)\s+(?:be\s+)?(?:hired|selected|chosen|accepted|offered)\b"
+                r"|\b(?:will|would|can|could)\s+you\s+(?:hire|select|choose|take|accept)\s+me\b"),
+    ("score", r"\bmy\s+(?:score|scores|marks?|points?|results?|grade|rating)\b|\bwhat(?:'s| is)\s+(?:the|my)\s+(?:score|result|grade|rating)\b"
+              r"|\b(?:give|show|tell)\s+me\s+(?:the\s+|my\s+|some\s+)?(?:points?|marks?|scores?|results?)\b"
+              r"|\b(?:did|do|will|would|can)\s+(?:i|we)\s+(?:pass|fail|clear|qualify)\b|\bhow\s+am\s+i\s+doing\b|\bhow\s+(?:many|much)\s+(?:points|marks)\b|\bam\s+i\s+(?:passing|failing)\b"),
+    ("help", r"\b(?:can|could|would|will|may)\s+(?:you|u)\s+(?:please\s+)?(?:teach|explain|tell|show|help|give|share|clarify|elaborate|describe|walk|rephrase|repeat|simplify)\b"
+             r"|\b(?:please\s+)?(?:teach|explain)\s+(?:it|that|this|me)\b|\bgive\s+(?:me\s+)?(?:a\s+|the\s+|some\s+)?(?:hint|hints|clue|answer|solution|tip)s?\b"
+             r"|\b(?:can|could|may)\s+(?:i|we)\s+(?:get|have|see|hear)\s+(?:a\s+|the\s+|some\s+)?(?:hint|hints|clue|answer|tip)s?\b"
+             r"|\b(?:what(?:'s| is| was)?|tell me)\s+(?:the\s+)?(?:correct\s+|right\s+)?(?:answer|solution)\b|\bwhat\s+do\s+you\s+mean\b"
+             r"|\bi\s+(?:don'?t|do not|dont)\s+understand\s+(?:the|this|your)\s+question\b"),
+]
+_REQUEST_RE = [(n, re.compile(p, re.I)) for n, p in _REQUESTS]
+_CLAUSE_SPLIT = re.compile(r"(?<=[.,;!?])\s+|\n+")
+
 # Slang, laughter, mockery, casual profanity.
 _UNPROFESSIONAL = [
     ("laughter", r"\b(?:hah+a*|haha+h*|haah+|hehe+h*|lol+|lmao|rofl)\b"),
@@ -48,6 +81,8 @@ class Behavior:
     label: str = "normal"                # normal | dismissive | unprofessional
     confident: bool = False              # "easy question" / boasting marker present
     signals: list = field(default_factory=list)
+    appeal: bool = False                 # personal / job-outcome appeal present (separate from the behaviour label)
+    request: str | None = None           # asks the interviewer for something: "help" | "score" | "outcome" (never technical content)
 
 
 def detect_behavior(text: str, profane: bool = False) -> Behavior:
@@ -60,6 +95,11 @@ def detect_behavior(text: str, profane: bool = False) -> Behavior:
     if profane:
         casual.append("unprofessional:profanity")
     boasting = [s for s in confident if s.endswith(":boasting")]
+    appeal = [f"appeal:{n}" for n, rx in _APPEAL_RE if rx.search(t)]
+    request = next((n for n, rx in _REQUEST_RE if rx.search(t)), None)
+    if request == "outcome":                    # "am I getting the job?" is a question to the interviewer, not boasting
+        confident = [s for s in confident if not s.endswith(":boasting")]
+        boasting = []
 
     if dismissive:
         label = "dismissive"
@@ -67,13 +107,16 @@ def detect_behavior(text: str, profane: bool = False) -> Behavior:
         label = "unprofessional"
     else:
         label = "normal"
-    return Behavior(label=label, confident=bool(confident), signals=dismissive + confident + casual)
+    return Behavior(label=label, confident=bool(confident), signals=dismissive + confident + casual + appeal + ([f"request:{request}"] if request else []),
+                    appeal=bool(appeal), request=request)
 
 
 def strip_markers(text: str) -> str:
     """The answer with behaviour chatter (slang, laughter, 'easy question', dismissals) removed, so technical quality is
     judged on the substance alone: 'damn its an easy question sir' must not count as an attempted answer."""
     t = text or ""
+    # clauses containing a personal appeal are not technical content ("my mom is sick i need money" must not count as terms)
+    t = " ".join(c for c in _CLAUSE_SPLIT.split(t) if not any(rx.search(c) for _n, rx in _APPEAL_RE + _REQUEST_RE))
     for _n, rx in _DISMISSIVE_RE + _CONFIDENT_RE + _UNPROFESSIONAL_RE:
         t = rx.sub(" ", t)
     t = re.sub(r"\b(?:sir|mate|man)\b", " ", t, flags=re.I)       # address terms that only appear with such chatter
